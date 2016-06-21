@@ -1,0 +1,356 @@
+---
+title: "Simulating Zip Code Effects"
+author: "Bob Horton"
+date: "Saturday, April 16, 2016"
+output: html_document
+---
+
+I'll use a simple rule to assign a propensity to each zip code in the United States. This will be matched up with a dedicated 'secret activity level' (`sal4`) as a driver for our simulated outcome (hospital readmission).
+
+I obtained two files from the US Census website:
+* (Complete Zip Code Totals File)[ftp://ftp.census.gov/econ2013/CBP_CSV/zbp13totals.zip] (Record Layout)[https://www.census.gov/econ/cbp/download/noise_layout/ZIP_Totals_Layout10.txt]
+* (Complete Zip Code Industry Details File)[ftp://ftp.census.gov/econ2013/CBP_CSV/zbp13detail.zip] (Record Layout)[https://www.census.gov/econ/cbp/download/noise_layout/ZIP_Detail_Layout.txt]
+
+Industry classifications are from the (2012 North American Industry Classification System)[https://www.census.gov/cgi-bin/sssd/naics/naicsrch?chart=2012] (2-6 digit 2012 Code Files)[https://www.census.gov/eos/www/naics/2012NAICS/2-digit_2012_Codes.xls] (which I re-saved in CSV format).
+
+```{r}
+DATA_DIR <- "zipcodes"
+# NAICS_codes <- read.csv(file.path(DATA_DIR, "2-digit_2012_Codes.csv"))
+
+zip_totals <- read.csv(file.path(DATA_DIR, "zbp13totals.txt"))
+rownames(zip_totals) <- zip_totals$zip
+# EMP             N       Total Mid-March Employees with Noise
+# QP1             N       Total First Quarter Payroll ($1,000) with Noise
+
+zip_details <- read.csv(file.path(DATA_DIR, "zbp13detail.txt"))
+# ZIP             C       ZIP Code
+# NAICS           C       Industry Code - 6-digit NAICS code.
+# EST             N       Total Number of Establishments
+
+
+```
+
+I found the population by "zip code tabulation area" through a (blog post)[https://blog.splitwise.com/2013/09/18/the-2010-us-census-population-by-zip-code-totally-free/].
+
+Unfortunately, some of the the zip codes in this table are duplicated. For lack of a better idea, I aggregated them by zip code, taking the sum.
+
+```{r zip_population}
+zip_population <- read.csv(file.path(DATA_DIR, "2010+Census+Population+By+Zipcode+(ZCTA).csv"))
+
+library(dplyr)
+zip_pop <- zip_population %>% group_by(Zip.Code.ZCTA) %>% summarize(population=sum(X2010.Census.Population)) %>% as.data.frame
+row.names(zip_pop) <- zip_pop$Zip.Code.ZCTA
+```
+
+Each zip code is evaluated for the ratio of convenience stores to grocery stores. Specifically, I will use these NAICS codes:
+* 44511 Supermarkets and Other Grocery (except Convenience) Stores 
+* 44512 Convenience Stores
+
+```{r}
+convenience <- zip_details[grepl("^44512", zip_details$naics),c("zip","est")]
+grocery <- zip_details[grepl("^44511", zip_details$naics),c("zip","est")]
+
+cg <- merge(grocery, convenience, by="zip", all=TRUE)
+names(cg) <- c("zip", "grocery", "convenience")
+rownames(cg) <- cg$zip
+
+head(cg)
+
+cg$grocery[is.na(cg$grocery)] <- 0.1
+cg$convenience[is.na(cg$convenience)] <- 0.1
+
+colSums(cg)
+
+cg <- transform(cg, ratio = convenience/grocery, 
+                log_cg_ratio = log(convenience)-log(grocery))
+head(cg)
+
+cg <- cg[order(cg$log_cg_ratio),]
+
+write.csv(cg, "zipcodes/zip_grocery_convenience.csv", row.names=FALSE)
+
+head(cg)
+tail(cg)
+
+hist(log(cg$ratio), breaks=100)
+```
+
+
+First, select the collection of zip codes to use, based on the population of each zip code. But first limit candidate to those for which we have a cg ratio.
+
+```{r pick_zipcodes}
+candidates <- as.character(intersect(cg$zip, zip_pop$Zip.Code.ZCTA))
+
+# pick enough zip codes so we can later assign one to each encounter
+N <- nrow(secret_activity_levels) # number of encounters
+zips <- sample(candidates, N, prob=zip_pop[candidates,]$population, replace=T)
+```
+
+Find the log of the convenience/grocery store ratio for each of these zip codes, and order them by that ratio.
+
+```{r cg_ratios_for_target_zipcodes}
+zip_cg <- cg[zips,c("zip", "log_cg_ratio")]
+zip_cg <- zip_cg[order(zip_cg$log_cg_ratio, decreasing=TRUE),]  
+  # positive means more convenience stores, so match with lower sal4.
+hist(zip_cg$log_cg_ratio, breaks=100)
+
+```
+
+Now match them to encounter_ids ordered by 'secret activity level 4" (`sal4`),  which correlates with outcome.
+
+```{r match_log_cg_ratio_to_sal4}
+SECRET_ACTIVITY_LEVEL_FILE <- "sim_secret_activity_levels.csv"
+
+secret_activity_levels <- read.csv(SECRET_ACTIVITY_LEVEL_FILE, row.names=1)
+secret_activity_levels$encounter_id <- as.integer(rownames(secret_activity_levels))
+
+sal4 <- secret_activity_levels[order(secret_activity_levels$sal4), c('encounter_id', 'sal4')]
+
+zipcode_assignments <- as.data.frame(cbind(encounter_id=sal4$encounter_id, zipcode=zip_cg$zip))
+rownames(zipcode_assignments) <- zipcode_assignments$encounter_id
+
+zipcode_assignments$zipcode <- as.character(zipcode_assignments$zipcode)
+zipcode_assignments <- transform(zipcode_assignments, city=zip_totals[zipcode,"city"], state=zip_totals[zipcode, "stabbr"])
+
+# put back in original order by encounter_id
+zipcode_assignments <- zipcode_assignments[rownames(secret_activity_levels),]
+
+write.csv(zipcode_assignments, file="sim_zipcode_assignments.csv", row.names=FALSE)
+```
+
+
+# Test to see if zip code now helps predict readmission
+
+```{r readmission_test}
+
+DATA_DIR <- "781670.f1"
+diabetes_data <- read.csv(file.path(DATA_DIR, "diabetic_data_initial.csv"), na.strings = c("?", "None"))
+
+
+zipcode_assignments$readmitted <- diabetes_data$readmitted
+zipcode_assignments <- transform(zipcode_assignments, 
+                                 is_readmitted=readmitted!="NO",
+                                 readmitted_30=readmitted=="<30")
+zipcode_assignments$zipcode <- factor(zipcode_assignments$zipcode)
+
+in_test_set <- runif(nrow(zipcode_assignments)) < 0.25
+test_set <- zipcode_assignments[in_test_set,]
+training_set <- zipcode_assignments[!in_test_set,]
+
+fit1 <- rxLogit(is_readmitted ~ zipcode, training_set, cube=TRUE)
+test_set$predict_readmitted <- rxPredict(fit1, test_set)[[1]]
+
+plot(predict_readmitted ~ factor(is_readmitted), data=test_set)
+
+rxRocCurve("is_readmitted", "predict_readmitted", test_set)
+
+fit2 <- rxLogit(readmitted_30 ~ zipcode, training_set, cube=TRUE)
+test_set$predicted_30 <- rxPredict(fit2, test_set)[[1]]
+
+rxRocCurve("readmitted_30", "predicted_30", test_set)
+
+```
+
+## Counting 
+
+
+```{r counting_outcomes_by_zipcode}
+
+pivot_factor_vec <- function(factor_vec){
+  lvls <- levels(factor_vec)
+  pivot_mat <- t(sapply(factor_vec, function(x) as.numeric(lvls==x)))
+  colnames(pivot_mat) <- lvls
+  pivot_mat
+}
+
+pivoted_outcomes <- with(zipcode_assignments, {
+                      piv_mat <- pivot_factor_vec(readmitted)
+                      data.frame(zipcode=as.character(zipcode),
+                        lt30 = piv_mat[,'<30'],
+                        gt30 = piv_mat[,'>30'],
+                        NO = piv_mat[,'NO'])
+                    })
+
+library(dplyr)
+library(tidyr)
+
+zipcode_outcome_counts <- pivoted_outcomes %>% 
+    group_by(zipcode) %>% 
+    summarize(lt30=sum(lt30), gt30=sum(gt30), NO=sum(NO)) %>%
+    as.data.frame
+
+rownames(zipcode_outcome_counts) <- as.character(zipcode_outcome_counts$zipcode)
+
+# head(rev(sort(table(zipcode_assignments$zipcode))))
+# zipcode_outcome_counts['90250',]
+
+write.csv(zipcode_outcome_counts, "zipcode_outcome_counts.csv")
+# hdfs_dir <- 'wasb:///...'
+# rxHadoopMakeDir(hdfs_dir)
+# rxHadoopCopyFromLocal("zipcode_outcome_counts.csv", file.path(hdfs_dir, "zipcode_outcome_counts.csv"))
+
+
+```
+## Reducing cardinality
+
+To avoid having to consider a huge number of different zipcodes, let's rank them by the impact they have on prediction. Basically, we'll multiply the effect size by the number of cases, using p-values to control overfitting.
+
+### First try
+
+
+```{r most_predictive_levels}
+diabetes_data <- readRDS("augmented_diabetes_data.Rmd")
+
+diabetes_data <- f32(diabetes_data, "diag_1")
+diabetes_data <- transform(diabetes_data, is_readmitted=readmitted != "NO")
+diabetes_data$num_age <- guess_age(diabetes_data$age)
+diabetes_data$zipcode <- factor(diabetes_data$zipcode)
+
+rownames(diabetes_data) <- diabetes_data$encounter_id
+diabetes_data <- diabetes_data[as.character(sensor_assignments$encounter_id), ]
+training_data <- diabetes_data[sensor_assignments$discharge_time < "2016-07-01",]
+
+# This does not work with rxLinMod
+fit <- rxLogit(is_readmitted ~ zipcode, training_data, cube=TRUE)
+
+coef_stats <- data.frame(name=names(coef(fit)), value=coef(fit), log_pval=log10(fit$coef.p.value))
+
+zip_counts <- table(training_data$zipcode)
+coef_stats$zip <- coef_stats$name %>% as.character %>% strsplit("\\=") %>% sapply(function(v) v[2])
+rownames(coef_stats) <- coef_stats$zip
+coef_stats$count <- zip_counts[coef_stats$zip]
+rbow <- rainbow(max(coef_stats$count), end=2/3)
+with(coef_stats[!is.na(coef_stats$value),], plot(value, -log_pval, col=rbow[count], xlim=c(-4,4)))
+
+candidates <- coef_stats[!is.na(coef_stats$value),]
+candidates <- candidates[order(candidates$log_pval^2 * candidates$value^2, decreasing=T),]
+keepers <- candidates$zip[1:127]
+with(candidates[keepers,], points(jitter(value), -log_pval, pch=20, cex=0.5))
+```
+
+Maybe I should originally order the zipcodes by count, so the biggest one becomes the reference (we want to include it anyway). 
+
+### Second Try
+
+```{r coefficient_selection}
+coefficient_data <- data.frame(
+  coefficient = coef(fit1),
+  zipcode = gsub("zipcode=", "", names(coef(fit1))),
+  p_value = fit1$coef.p.value,
+  adj_p_value = p.adjust(fit1$coef.p.value, method="BH")
+)
+
+zip_counts <- table(training_set$zipcode)
+coefficient_data <- transform(coefficient_data,
+                              count=zip_counts[zipcode],
+                              color=ceiling(10*sqrt(zip_counts[zipcode])))
+
+rownames(coefficient_data) <- coefficient_data$zipcode
+
+rbow <- rainbow(max(coefficient_data$color), end=2/3)
+with(coefficient_data, {
+     plot(p_value, adj_p_value, col=rbow[coefficient_data$color])
+     plot(coefficient, -log10(adj_p_value), col=rbow[coefficient_data$color], xlim=c(-4,4), ylim=c(0,10))
+})
+
+coefficient_data$score <- with(coefficient_data, ifelse(adj_p_value < 1, count * abs(coefficient), 0))
+
+coefficient_data <- coefficient_data[order(coefficient_data$score, decreasing=TRUE, na.last=TRUE),]
+
+score_rbow <- rainbow(max(1+coefficient_data$score, na.rm=T)/10, end=2/3)
+with(coefficient_data[which(coefficient_data$score > 0),], {
+  hist(score)
+  plot(coefficient, -log10(adj_p_value), col=score_rbow[score/10])
+})
+
+keepers <- coefficient_data[which(coefficient_data$score > 0),"zipcode"]
+length(keepers) # 1887
+length(levels(keepers)) # 15247
+zip_keepers <- as.character(keepers)
+
+knitr::kable(head(coefficient_data, n=100))
+```
+
+How can a zipcode have a coefficient if its count is zero?
+
+## Try out the reduced-levels zip code
+
+```{r zip1000}
+zipcode_assignments$zip_keepers <- factor(as.character(zipcode_assignments$zipcode), levels=c(zip_keepers, "other"))
+zipcode_assignments$zip_keepers[is.na(zipcode_assignments$zip_keepers)] <- "other"
+
+test_set <- zipcode_assignments[in_test_set,]
+training_set <- zipcode_assignments[!in_test_set,]
+
+
+fit_zip_keepers <- rxLogit(is_readmitted ~ zip_keepers, training_set, cube=TRUE)
+test_set$pred_zip_keepers <- rxPredict(fit_zip_keepers, test_set)[[1]]
+rxRocCurve("is_readmitted", "pred_zip_keepers", test_set)
+
+```
+
+# Machine Learning Lesson of the Day
+
+We gain a tremendous amount of predictive capacity from the statistically questionable coefficients.
+
+# Characterizing zipcodes
+
+I want to find characteristics of zipcodes that I can plot on a map
+
+```{r characterizing_zipcodes}
+
+```{r load_zipcode_data}
+zbp13detail <- read.csv("zipcodes/zbp13detail.txt")
+zbp13totals <- read.csv("zipcodes/zbp13totals.txt")
+naics <- read.csv("zipcodes/NAICS_Codes.csv", stringsAsFactors=FALSE)
+naics <- transform(naics, len=nchar(as.character(naics$Code)))
+naics <- transform(naics, tag=paste0(Code, substring("-------", 1, 6 - len)))
+rownames(naics) <- naics$tag
+
+
+
+zbp2 <- zbp13detail[grepl("\\d\\d\\-\\-\\-\\-", zbp13detail$naics),c("zip","naics","est")]
+library(tidyr)
+zbp_wide <- spread(zbp2, naics, est) # all the major industry sectors for each zipcode
+zbp_mat <- as.matrix(zbp_wide[2:21])
+rownames(zbp_mat) <- zbp_wide$zip
+zbp_mat[is.na(zbp_mat)] <- 0
+zbp_scaled <- t(scale(t(zbp_mat))) # scale the rows
+colnames(zbp_scaled) <- naics[colnames(zbp_scaled), "Title"]
+
+#PCA
+fit <- princomp(zbp_scaled, cor=TRUE)
+summary(fit) # print variance accounted for 
+loadings(fit) # pc loadings 
+plot(fit, type="lines") # scree plot 
+fit$scores # the principal components
+biplot(fit)
+
+# Clustering
+# cluster the industries: missing 31, 44, 48, 99
+# 31-33 Manufacturing
+# 44-45 Retail Trade
+# 48-49 Transportation and Warehousing
+
+d <- dist(t(zbp_scaled), method = "euclidean") # distance matrix
+fit <- hclust(d, method="ward.D") 
+plot(fit, main="clustered industries") # display dendogram
+groups <- cutree(fit, k=5) # cut tree into 5 clusters
+# draw dendogram with red borders around the 5 clusters 
+rect.hclust(fit, k=5, border="red")
+
+
+# do k-means clustering, with scree plots to find optimal number of clusters for zip codes.
+d <- dist(mydata, method = "euclidean") # distance matrix
+fit <- hclust(d, method="ward") 
+plot(fit) # display dendogram
+groups <- cutree(fit, k=5) # cut tree into 5 clusters
+# draw dendogram with red borders around the 5 clusters 
+rect.hclust(fit, k=5, border="red")
+
+# Color a map in PowerBI
+
+```
+
+
+```

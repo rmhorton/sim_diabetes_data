@@ -1,0 +1,421 @@
+---
+title: "Simulating wearable sensor data"
+author: "Bob Horton"
+date: "Wednesday, March 23, 2016"
+output: html_document
+---
+
+Here we simulate a time series of "activity state" for each patient over the time of the study; this will be shared between the vital sign and glucose simulations.
+
+# Mapping Sensors to Patients
+
+To map a sensor to a patient, we need a table relating sensor ID with patient ID. Each time a patient is discharged from the hospital, he or she will be issued a vital sign activity sensor and a CGMS monitor for four days. Here is a function to generate sensor ID strings from an encounter id (really just the hexadecimal representation of the encounter id number):
+
+```{r setup}
+# cd /mnt/data/rhorton/EMR/sim_activity
+# nice -n10 nohup Rscript run_sim_activity.R&
+set.seed(123)
+SIM_START_TIME <- as.POSIXct("2016-01-01 00:00:00")
+SECRET_ACTIVITY_LEVEL_FILE <- "sim_secret_activity_levels.csv"
+
+# inputs from other scripts
+SENSOR_ASSIGNMENTS_FILE <- "sim_sensor_assignments.csv"
+
+# outputs of this script
+ACTIVITY_STATE_FILE <- "sim_activity_states.csv"
+
+RESULTS_DIR <- "sim_results"
+BATCH_SIZE <- NULL # set to NULL to do them all
+source("sim_activity_lib.R")
+
+library(doParallel)
+library(foreach)
+registerDoParallel(4)
+
+```
+```{r sim_sensor_id}
+REGENERATE_SENSOR_ASSIGNMENTS <- FALSE
+
+if (REGENERATE_SENSOR_ASSIGNMENTS){
+  str_rev <- function(v) paste(rev(strsplit(v, '')[[1]]), collapse='')
+  
+  sim_cgms_id <- function(eid) paste0("CGM", str_rev(sprintf("%06X", eid %% 2^24)))
+  
+  sim_sensor_id <- function(eid)
+    sprintf("VSS%03X-%04d", round(eid / 2^12) %% 2^12, eid %% 2^13)
+  
+  encounter_ids <- secret_activity_levels$encounter_id
+  
+  discharge_time <- SIM_START_TIME + 60 * round(runif(length(encounter_ids), min=0, max=365*24*60))
+  
+  # Don't discharge anyone in the middle of the night
+  library(lubridate)
+  night_times <- (hour(discharge_time) > 22) | (hour(discharge_time) < 7)
+  discharge_time[night_times] <- discharge_time[night_times] + 10 * 3600
+  
+  sensor_assignments <- data.frame(
+    encounter_id=encounter_ids, 
+    discharge_time=discharge_time,
+    cgms_id=sapply(encounter_ids, sim_cgms_id),
+    vital_sensor_id=sapply(encounter_ids, sim_sensor_id)
+  )
+  
+  write.csv(sensor_assignments, file=SENSOR_ASSIGNMENTS_FILE, row.names=FALSE)
+}
+
+sensor_assignments <- read.csv(SENSOR_ASSIGNMENTS_FILE, 
+                               colClasses=c("integer", "character", "factor", "factor"))
+sensor_assignments$discharge_time <- as.POSIXct(sensor_assignments$discharge_time)
+
+secret_activity_levels <- read.csv(SECRET_ACTIVITY_LEVEL_FILE, row.names=1)
+secret_activity_levels$encounter_id <- as.integer(rownames(secret_activity_levels))
+
+NUMROWS <- if (!is.null(BATCH_SIZE)) BATCH_SIZE else nrow(sensor_assignments)
+
+```
+Considering the postures as states, we construct a set of state-transition matrixes. These depend on how sedentary an individual is, as well as time of day. There are different state transition matrixes for the two extreme activity levels (active vs sedentary), and for the different parts of the day (night, day, and meal time). Each patient will have a set of transition matrices obtained by a weighted averaging of the active and sedentary matrices for each part of the day.
+
+```{r posture_transition_model}
+source("sim_activity_lib.R")
+```
+
+This calculates a huge matrix with one row per patient and one column per minute of the simulation. I don't actually use this matrix any more because I re-calculate the activity states on the fly, seeding each one with its own encounter id.
+
+```{r simulate_activity, eval=FALSE}
+RECALCULATE_ACTIVITY_STATE <- FALSE
+
+if (RECALCULATE_ACTIVITY_STATE){
+  PATIENT_STATE <- calculate_activity_states(secret_activity_levels[1:NUMROWS,])
+  saveRDS(PATIENT_STATE, file=ACTIVITY_STATE_FILE)
+}
+
+PATIENT_STATE <- readRDS(ACTIVITY_STATE_FILE)
+
+sal1 <- secret_activity_levels$sal1[1:100]
+active_patients <- PATIENT_STATE[sal1 > 0.80,]
+sedentary_patients <- PATIENT_STATE[sal1 < 0.20,]
+table(active_patients)/sum(table(active_patients))
+table(sedentary_patients)/sum(table(sedentary_patients))
+
+image(PATIENT_STATE, xlab="patients", ylab="time")
+```
+
+Each patient has a circadian shift, normally distributed with mean 0 and standard deviation 45 minutes. This shift is modulo 24 hours.
+
+These states will drive both the vital sign sensor simulation and the CGMS wave-form generation.
+
+## Simulating vital sign sensor data
+
+Using a multivariate normal model similar to the one developed for an earlier project, we simulate readings based on the patient state data simulated above.
+
+```{r sim_vitals}
+posture_parameters <- list(
+  sleeping = list(
+		mu1 = c(mean_nn=1018.56, resp_mean=14.53, tmp_mean=3497.13),
+		mu2 = c(mean_nn=-0.01602650, resp_mean=-0.02985727, tmp_mean=0.01107901),
+		covmat = matrix(c(	 0.0115636161, -0.0028348858, 0.0004820121,
+							-0.0028348858, 0.0531831349, 0.0004261291,
+							 0.0004820121, 0.0004261291, 0.0010656038),
+						nrow=3,
+						dimnames=list(c("mean_nn", "resp_mean", "tmp_mean"), c("mean_nn", "resp_mean", "tmp_mean"))
+				),
+		lambda = c(mean_nn= -1.1956661, resp_mean= -0.1115796, tmp_mean=14.5676367) 
+	),
+
+	sitting = list(
+		mu1 = c(mean_nn=60000/60, resp_mean=16, tmp_mean=3380), 
+		mu2 = c(mean_nn=0.00523911177548125, resp_mean=-0.0200091971821931, tmp_mean=0.00307098947723213), 
+		covmat = matrix(c(0.012148810323148, -0.00671422442859444, 0.00029494650025186, 
+						-0.00671422442859444, 0.0544610729833635, 0.000130140613071403, 
+						0.00029494650025186, 0.000130140613071403, 0.00168196931879113), 
+						nrow=3, 
+						dimnames = list(c("mean_nn", "resp_mean", "tmp_mean"), c("mean_nn", "resp_mean", "tmp_mean"))
+				), 
+		lambda = c(mean_nn=1.82617301237283, resp_mean=0.265557072491748, tmp_mean=4.55392273721502)
+	), 
+
+	walking = list(
+		mu1 = c(mean_nn=684.248889952842, resp_mean=22.529991074444, tmp_mean=3183.70210956723),
+		mu2 = c(mean_nn=-0.0316623855325804, resp_mean=-0.0183664817043557, tmp_mean=0.00693762292651569), 
+		covmat = matrix(c(0.0448666194673655, -0.0214780553875364, 0.00348324250918412, 
+						-0.0214780553875364, 0.0630898545439547, -0.00572124251031655, 
+						0.00348324250918412, -0.00572124251031655, 0.00415251849362531), 
+				nrow=3, 
+				dimnames = list(c("mean_nn", "resp_mean", "tmp_mean"), c("mean_nn", "resp_mean", "tmp_mean"))
+		), 
+		lambda = c(mean_nn=-0.383568295612219, resp_mean=0.416905196681497, tmp_mean=4.21231085597155)
+	)
+)
+
+posture_parameters$resting <- posture_parameters$sleeping
+posture_parameters$resting$mu1 <- c(mean_nn=60000/55, resp_mean=15, tmp_mean=3490)
+
+posture_parameters$standing <- posture_parameters$sitting
+posture_parameters$standing$mu1 <- c(mean_nn=60000/64, resp_mean=17, tmp_mean=3400)
+
+posture_parameters$eating <- posture_parameters$sitting
+posture_parameters$eating$mu1 <- c(mean_nn=60000/65, resp_mean=17.5, tmp_mean=3500)
+
+posture_parameters$running <- posture_parameters$walking
+posture_parameters$running$mu1 <- c(mean_nn=60000/130, resp_mean=40, tmp_mean=3000)
+
+xform <- function(U, lambda) (U^(lambda)-1)/lambda
+invxform <- function(V, lambda) (V * lambda + 1)^(1/lambda)
+
+sim_sensor <- function(N, posture_id, pparam){
+  posture <- simulated_postures[posture_id]
+  library(mvtnorm)
+  pp <- pparam[[posture]]
+  M1 <- rmvnorm(N, mean=pp$mu2, sigma=pp$covmat)
+  M2 <- t(apply(M1, 1, invxform, pp$lambda))
+  M3 <- t(apply(M2, 1, "*", pp$mu1))
+  simdat <- cbind(as.data.frame(M3), pPO=posture)
+  transform(simdat, bpm_mean=60000 / mean_nn)
+}
+
+sim_vitals <- function(sensor_id, start_time, state_vec){
+  sim_second <- 0
+  # 10 measurements / minute: temperature every 60 sec, resp_rate every 30 sec, posture and bpm every 15 sec 
+  record <- '{"t":%d,"n":"%s","v":%d}'
+  output <- character(10 * length(state_vec))
+  ptr <- 1
+  for (minute in seq_along(state_vec)){
+    posture <- state_vec[minute]
+    ss <- sim_sensor(4, posture, posture_parameters)
+    ss$resp_mean <- as.integer(round(100 * ss$resp_mean))
+    ss$bpm_mean <- as.integer(round(100 * ss$bpm_mean))
+    ss$tmp_mean <- as.integer(round(ss$tmp_mean))
+    
+    output[ptr+0] <- sprintf(record,sim_second+00,"ts", ss[1,"tmp_mean"])
+    output[ptr+1] <- sprintf(record,sim_second+00,"re", ss[1,"resp_mean"])
+    output[ptr+2] <- sprintf(record,sim_second+00,"po",which(simulated_postures==as.character(ss[1,"pPO"])))
+    output[ptr+3] <- sprintf(record,sim_second+00,"hr",ss[1,"bpm_mean"])
+    output[ptr+4] <- sprintf(record,sim_second+15,"po",which(simulated_postures==as.character(ss[2,"pPO"])))
+    output[ptr+5] <- sprintf(record,sim_second+15,"hr",ss[2,"bpm_mean"])
+    output[ptr+6] <- sprintf(record,sim_second+30,"re", ss[3,"resp_mean"])
+    output[ptr+7] <- sprintf(record,sim_second+30,"po",which(simulated_postures==as.character(ss[3,"pPO"])))
+    output[ptr+8] <- sprintf(record,sim_second+30,"hr",ss[3,"bpm_mean"])  
+    output[ptr+9] <- sprintf(record,sim_second+45,"po",which(simulated_postures==as.character(ss[4,"pPO"])))
+    output[ptr+10] <- sprintf(record,sim_second+45,"hr",ss[4,"bpm_mean"])
+    ptr <- ptr + 11
+    sim_second <- sim_second + 60
+  }
+  template_whitespace <- '{\n\t"sensor_id":"%s",\n\t"bt":%d,\n\t"e":[\n\t\t%s\n\t\n]}\n'
+  spacer_whitespace <- ',\n\t\t'
+  template <- '{"sensor_id":"%s","bt":%d,"e":[%s]}\n'
+  spacer <- ','
+  paste(sprintf(template, sensor_id, start_time, paste(output, collapse=spacer)))
+}
+
+# cat(sim_vitals("foo", 1000, c(1,2,3,4,5,6,7)))
+
+```
+
+# Generate Sensor Files
+
+```{r generate_sensor_files}
+sensor_assignments <- sensor_assignments[order(sensor_assignments$discharge_time),]
+
+if (!file.exists(RESULTS_DIR)) dir.create(RESULTS_DIR)
+sensor_simulation <- function(i){
+
+  sensor_info <- sensor_assignments[i,]
+  folder_name <- format(sensor_info$discharge_time, format="%Y%m%d")  # "20160415"
+  folder_path <- file.path(RESULTS_DIR, folder_name)
+  if (!file.exists(folder_path)) dir.create(folder_path)
+  sensor_id <- sensor_info$vital_sensor_id
+  t0 <- as.integer(sensor_info$discharge_time)
+  v <- secret_activity_levels[as.character(sensor_info$encounter_id),]
+  state_vec <- sim_state(v[['sal1']], seed=v[['encounter_id']])
+  file_name <- paste0(paste(folder_name, sensor_id, sep="_"), ".json")
+  file_path <- file.path(folder_path, file_name)
+  writeLines(sim_vitals(sensor_id, t0, state_vec), file_path)
+}
+
+# for (i in 1:NUMROWS) sensor_simulation(i)
+foreach(i=1:NUMROWS) %dopar% sensor_simulation(i)
+
+
+```
+
+Floating point values are multiplied by 100 and truncated to an integer.
+
+Note that we are using encounter id as random number seed; this way we can generate the state sequence on the fly, so we don't need to store it.
+
+
+## Simulating CGMS data
+
+```{r sim_sugar}
+
+map2quantiles <- function(v, quantile_value_out){
+  quantile_in <- cut(v, breaks=quantile(v, prob=0:100/100), 
+                     labels=paste0(1:100, "%"), include.lowest=T)
+  quantile_value_out[quantile_in]
+}
+
+sim_sugar <- function(state_vec, quantile_vec){
+  burn_rate <- c(
+    -1,   # sleeping
+    -1.5, # resting
+    -2,   # sitting
+    400,   # eating
+    -4,   # standing
+    -8,  # walking
+    -16   # running
+  )
+  
+  # create a crude bumpy pattern based on diet and activity
+  v1 <- cumsum(burn_rate[state_vec])
+  # adjust for overall trend
+  tt <- seq_along(v1)
+  beta <- coef(lm(v1 ~ tt))
+  v2 <- v1 - (beta[1] + beta[2] * tt) + rnorm(length(v1), sd=200)
+  # smooth
+  v3 <- loess(v2 ~ tt, span=0.01)$fitted
+  
+  # squashing makes it look better, but shouldn't matter if you are mapping quantiles
+  # v_squash <- sqrt(exp(v3/4000))
+  #   squash against floor?
+  #   scale and shift to adjust mean and range?
+
+  
+  # lognormal density shaped peaks
+  #   vv2 <- numeric(length(state_vec))
+  #   for (i in 1:(length(vv2) - 240)) {
+  #     x <- 1:241
+  #     if (state_vec[i]==4) 
+  #       vv2[i:(i+240)] <- vv2[i:(i+240)] + 10 * dlnorm(x, meanlog=log(80), sdlog=log(1.5))
+  #     else vv2[i] <- vv2[i] + burn_rate[state_vec[i]]
+  #   }
+
+  map2quantiles(v3, quantile_vec)
+
+}
+
+test_sim_sugar <- function(state_vec){
+  user_quantile_matrix <- readRDS("user_glucose_quantiles.rds")
+  ss <- sim_sugar(state_vec, user_quantile_matrix[1,])
+
+  # aggregate sugar in 3 minute reporting windows
+  cgms3min <- aggregate(ss, by=list(ceiling(seq_along(ss)/3)), FUN=mean)
+
+  plot(cgms3min$x, type='l')
+}
+```
+
+### Generate cgms Files
+
+```{r generate_cgms_files}
+CGMS_DIR <- "sim_cgms_results"
+
+DATA_DIR <- "781670.f1"
+diabetes_data <- read.csv(file.path(DATA_DIR, "diabetic_data_initial.csv"), na.strings = c("?", "None"))
+
+glucose_to_a1c <- function(glucose_mM) 1.6130204 + 0.6287106 * glucose_mM
+a1c_to_glucose <- function(a1c) (a1c - 1.6130204)/0.6287106
+
+sensor_assignments <- sensor_assignments[order(sensor_assignments$discharge_time),]
+
+cgms_simulation <- function(i, SAVE_FILES=TRUE){
+  sensor_info <- sensor_assignments[i,]
+  folder_name <- format(sensor_info$discharge_time, format="%Y%m%d")  # "20160415"
+  folder_path <- file.path(CGMS_DIR, folder_name)
+  if (SAVE_FILES && !file.exists(folder_path)) dir.create(folder_path)
+  sensor_id <- sensor_info$cgms_id
+  t0 <- as.integer(sensor_info$discharge_time)
+  #v <- secret_activity_levels[secret_activity_levels$encounter_id==sensor_info$encounter_id,]
+  v <- secret_activity_levels[as.character(sensor_info$encounter_id),]
+  state_vec <- sim_state(v[['sal1']], seed=v[['encounter_id']])
+  file_name <- paste0(paste(folder_name, sensor_id, sep="_"), ".csv")
+  file_path <- file.path(folder_path, file_name)
+  mean_glucose <- rnorm(1, mean=7, sd=1.5)
+  pow <- 5 - 3*v[['sal2']]
+  glucose_quantiles <- qnorm(p=0:100/100, mean=mean_glucose^(1/pow), sd=0.25)^pow
+  ss <- sim_sugar(state_vec, glucose_quantiles) # aggregate sugar in 3 minute reporting windows
+  ss <- mean_glucose * ss/mean(ss, na.rm=TRUE)
+  cgms3min <- aggregate(ss, by=list(reltime=ceiling(seq_along(ss)/3)-1), FUN=mean)
+  df <- data.frame(time=sensor_info$discharge_time + cgms3min$reltime * 180, glucose=cgms3min$x)
+  if (SAVE_FILES) 
+    write.csv(format(df, digits=2, nsmall=2), file_path, row.names=FALSE, quote=FALSE) # quote was true on the last run
+  return(df)
+}
+
+if (!file.exists(CGMS_DIR)) dir.create(CGMS_DIR)
+# foreach(i=1:NUMROWS) %dopar% cgms_simulation(i)
+
+# Once again: also collect the statistics
+cgms_stats <- foreach(i=1:NUMROWS) %dopar% {
+  cgms <- cgms_simulation(i)
+  c(mean=mean(cgms$glucose, na.rm=TRUE), sd=sd(cgms$glucose, na.rm=TRUE))
+}
+saveRDS(do.call("rbind", cgms_stats), file="cgms_stats_matrix.Rds")
+# rows are in the same order as sensor_assignments, which are sorted by discharge time.
+
+test_cgms_simulation <- function(){
+  foo <- lapply(1:100, cgms_simulation, SAVE_FILES=FALSE)
+  glucose_mean <- sapply(foo, function(df) mean(df$glucose, na.rm=T))
+  glucose_sd <- sapply(foo, function(df) sd(df$glucose, na.rm=T))
+  outcome <- diabetes_data$readmitted
+  names(outcome) <- diabetes_data$encounter_id
+  outcome <- outcome[as.character(sensor_assignments$encounter_id)]
+  plot(outcome[1:100], glucose_mean)
+  plot(outcome[1:100], glucose_sd)
+}
+# test_cgms_simulation()
+```
+
+The night dayparts encourage sleeping, and mealtime dayparts encourage the eating state. Other dayparts also allow eating, which represents snacks. 
+
+Blood sugar is a lagging window function over eating states. 
+
+# Plot Example Results
+
+```{r plot_example_results}
+cgms <- read.csv("sim_cgms_results_quoted/20160101/20160101_CGM004845.csv", stringsAsFactors=FALSE)
+library(rjson)
+vitals <- fromJSON(file="sim_results/vitals/20160101/20160101_vss008-1658.json")
+
+#"sim_results/20160101/20160101_VSS02C-1050.json")
+plot_vitals <- function(vj){
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  bt <- vj$bt
+  ldf <- lapply(vj$e, function(l){
+    if (is.null(l$v)) l$v <- NA
+    tryCatch ( as.data.frame(l, stringsAsFactors=F), error=function(e) NA)
+  })
+  e_long <- bind_rows(ldf)
+  e_long$t <- as.POSIXct(bt + e_long$t, origin="1970-01-01")
+  divide_vals <- e_long$n %in% c("hr", "re", "ts")
+  e_long[divide_vals,"v"] <- e_long[divide_vals,"v"]/100
+  e_long$n <- e_long$n %>% gsub("^hr$", "heart rate", .) %>%
+                            gsub("^po$", "activity category", .) %>%
+                            gsub("^re$", "respiratory rate", .) %>%
+                            gsub("^ts$", "skin temperature", .) %>% 
+                            as.factor
+  
+  ggplot(e_long, aes(x=t, y=v, col=n)) + 
+    geom_point() + geom_smooth(col="black") + 
+    facet_grid(n ~ ., scales="free_y")
+}
+                 
+
+cgms$time <- as.POSIXct(cgms$time)
+png(filename="demo/cgms_plot.png", width=480, height=120)
+ggplot(cgms, aes(x=time, y=glucose)) + geom_line(col="blue", size=1.5)
+dev.off()
+
+```
+
+# Other Ideas:
+
+Build a predictive model and score the patients from the readmission dataset.
+Sort the glucose quantile matrix by its variability (maybe the interquartile range). Normalize the mean (add the desired mean minus the current mean) to make it match the main dataset.
+Assign most poorly controlled (highest variability) blood sugar curves to the patients most likely to be readmitted.
+
+Sensors are given to patients when they are discharged from the hospital and worn for 4 days.
+Find the discharge date for each patient, and have their readings start at that point.
+
+Meal constituents could vary by individual, and affect blood sugar.
+

@@ -1,0 +1,205 @@
+---
+title: "Simulated Grocery Lists"
+author: "Bob Horton"
+date: "Sunday, April 17, 2016"
+output: html_document
+---
+
+Here I generate a list of food purchases for each patient encounter. The approach is similar to the zipcode simulation; first, I make a big collection of grocery lists, one per patient encounter. I calculate the feature variable for each list (fraction of calories from carbohydrate).
+
+
+
+```{r}
+GROCERY_DATA_DIR <- "sim_groceries"
+
+
+```
+
+
+
+```{r show_fndds_tables, echo=FALSE, eval=FALSE}
+FNDDS_FILE <- "sim_groceries/fndds.sqlite"
+library(RSQLite)
+db <- dbConnect(SQLite(), FNDDS_FILE)
+
+dbListTables(db) -> tables
+names(tables) <- tables
+lapply(tables, function(tbl) dbGetQuery(db, sprintf("select * from %s limit 6", tbl)))
+```
+
+```{r load_food_nutrient_matrix}
+load("sim_groceries/food_nutrient_mat.Rdata")
+
+foods <- rownames(food_nutrient_mat)
+```
+
+```{r load_secret_activity_levels}
+SECRET_ACTIVITY_LEVEL_FILE <- "sim_secret_activity_levels.csv"
+
+secret_activity_levels <- read.csv(SECRET_ACTIVITY_LEVEL_FILE, row.names=1)
+secret_activity_levels$encounter_id <- as.integer(rownames(secret_activity_levels))
+
+```
+
+
+
+```{r diets}
+N <- nrow(secret_activity_levels)
+set.seed(123)
+diets <- matrix(rbinom(length(foods) * N, size=3, prob=0.1), nrow=N)
+rownames(diets) <- sprintf("diet%05d", 1:N)
+colnames(diets) <- rownames(food_nutrient_mat)
+saveRDS(diets, "sim_diets.Rds")
+
+nutrients <- diets %*% food_nutrient_mat
+
+calories_from_carbs <- apply(nutrients, 1, function(v) sum(4.1 * v["Carbohydrate"]))
+calories_from_protein <- apply(nutrients, 1, function(v) sum(4.1 * v["Protein"]))
+calories_from_fat <- apply(nutrients, 1, function(v) 8.8 * sum(v["Total Fat"]))
+calories_from_alcohol <- apply(nutrients, 1, function(v) sum(6.9 * v["Alcohol"]))
+calories_total <- apply(nutrients, 1, function(v) sum(v["Energy"]))
+
+sum_of_calories <- calories_from_carbs + calories_from_protein + calories_from_fat
+
+# reported total calories do not seem to include alcohol
+plot(calories_total, sum_of_calories + calories_from_alcohol, pch='.', 
+     main="sum including alcohol")
+abline(0, 1, col="red")
+plot(calories_total, sum_of_calories, pch='.', 
+     main="sum not counting alcohol")
+abline(0, 1, col="red")
+
+pct_calories_from_carbs <- 100 * calories_from_carbs / (sum_of_calories + calories_from_alcohol)
+pct_calories_from_carbs <- sort(pct_calories_from_carbs)
+
+```
+
+
+# Assign diets to patients
+
+```{r match_diets_to_sal5}
+
+sal5 <- secret_activity_levels$sal5
+names(sal5) <- rownames(secret_activity_levels)
+sal5 <- sort(sal5, decreasing=TRUE)
+
+# align diets with sal5
+diet_assignments <- data.frame(encounter_id=names(sal5), diet=names(pct_calories_from_carbs), pct_calories_from_carbs=pct_calories_from_carbs, row.names=names(sal5))
+
+# restore original order
+diet_assignments <- diet_assignments[rownames(secret_activity_levels),]
+
+write.csv(diet_assignments, file="sim_diet_assignments.csv", row.names=FALSE)
+```
+
+# Write out Diet data
+
+Originally we plannded to put diet data in XML format, but we'll use JSON for simplicity.
+
+```{r write_diet_xml}
+diets <- readRDS("sim_diets.Rds")
+grocery_lists <- apply(diets, 1, function(v){
+  quantities <- 100 * v[v!=0]
+  # items <- mapply(function(n, q) sprintf('<item name="%s" units="g">%d</item>', n, q), 
+  #                                        names(quantities), quantities)
+  data.frame(item=names(quantities), quantity=quantities, units="g")
+})
+
+# XML version
+# library(kulife)
+# for (i in seq_along(grocery_lists)){
+#   outfile <- file.path("grocery_xml", paste0(names(grocery_lists)[i],".xml"))
+#   write.xml(grocery_lists[[i]], outfile)
+# }
+
+write_json <- function(df, id, file){
+  for (v in names(df))
+    if (is.factor(df[[v]]) || is.character(df[[v]]))
+      df[[v]] <- sprintf('"%s"', as.character(df[[v]]))
+  grocery_elements <- lapply(1:nrow(df), function(rownum){
+      row <- df[rownum,]
+      paste(sprintf('"%s"',names(df[rownum,])), df[rownum,], sep=":", collapse=',')
+    })
+  grocery_str <- paste(grocery_elements, sep=',', collapse='},{')
+  json <- sprintf('{"id":"%s", "groceries":[{%s}]}\n', id, grocery_str)
+  writeLines(json, file)
+}
+
+if (!file.exists("grocery_xml")) dir.create("grocery_xml")
+for (i in seq_along(grocery_lists)){
+  outfile <- file.path("grocery_xml", paste0(names(grocery_lists)[i],".json"))
+  write_json(grocery_lists[[i]], names(grocery_lists)[i], file=outfile)
+}
+
+
+```
+
+# Export Selected Food Nutrients for Hive
+
+```{r export_fndf}
+library(dplyr)
+library(tidyr)
+
+keeper_nutrients <- c(carbs="Carbohydrate", protein="Protein", fat="Total Fat", alcohol="Alcohol", fiber="Fiber, total dietary", water="Water", energy="Energy")
+fndf <- as.data.frame(food_nutrient_mat[,keeper_nutrients])
+colnames(fndf) <- names(keeper_nutrients)
+# rownames(fndf) <- gsub(",", "", rownames(fndf))
+fndf$food <- gsub(",", "", rownames(fndf))
+
+food_nutrient_table_long <- gather(fndf, nutrient, quantity, -food)
+write.csv(food_nutrient_table_long, "food_nutrient_table_long.csv", row.names=FALSE)
+# write.table(fntl, "food_nutrients.csv", sep=',', quote=FALSE, row.names=FALSE, col.names=FALSE)
+
+```
+
+# Analyzing grocery data
+
+Save a subset of grocery data for practice. Convert the list of data frames (`grocery_lists`), each of which we need to convert to macronutrients, into one big happy table. Commas are removed from food names in the Pig JSON-to-CSV conversion because the RxTextData HDFS reader does not respect quoted fields, so we'll get rid of them here as well.
+
+```{r save_grocery_sample}
+grocery_table <- do.call("rbind", lapply(1:100, function(i){
+  df <- grocery_lists[[i]]
+  df$diet_id <- names(grocery_lists)[[i]]
+  df$item <- gsub(",","",df$item)
+  df
+}))
+
+write.table(grocery_table, "grocery_table.csv", sep=',', row.names=FALSE, col.names=FALSE, quote=FALSE)
+
+```
+
+
+Here I do the conversion using sqldf, as practice for doing the real thing in Hive.
+
+```{r analyze_grocery_lists}
+
+food_nutrient_table_long <- read.csv("food_nutrient_table_long.csv")
+grocery_table <- read.csv("grocery_table.csv")
+
+library(sqldf)
+# see http://stackoverflow.com/questions/1237068/pivot-in-sqlite
+
+sql_pct_cal_carb <- sqldf("with nut as (
+      select diet_id, nutrient, sum(fn.quantity * g.quantity/100) as quantity 
+          from grocery_table g join food_nutrient_table_long fn
+            on g.item = fn.food
+          group by diet_id, nutrient
+  ),
+  diet_nutrients as (select diet_id, 
+      sum(case when nutrient = 'carbs' then 4.1 * quantity end) carb_calories,
+      sum(case when nutrient = 'energy' then quantity end) calories
+      from nut group by diet_id)
+  select diet_id, (100*carb_calories/calories) as pct_calories_carbs from diet_nutrients")
+
+head(sql_pct_cal_carb)
+```
+
+## Compare to matrix multiplication
+
+```{r compare_to_matrix_multiplication}
+diet_nut_mat <- diets[1:100,] %*% food_nutrient_mat
+r_pct_cal_carb <- 100 * 4.1 * diet_nut_mat[,"Carbohydrate"]/diet_nut_mat[,"Energy"]
+
+plot(r_pct_cal_carb, sql_pct_cal_carb$pct_calories_carbs)
+abline(0,1,col="red")
+```

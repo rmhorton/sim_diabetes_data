@@ -1,0 +1,132 @@
+---
+title: "Simulating wearable sensor data"
+author: "Bob Horton"
+date: "Wednesday, March 23, 2016"
+output: html_document
+---
+
+Using the multivariate normal model developed for another project, I will simulate sensor readings to complement the EMR data from the diabetes hospital readmission study.
+
+
+```{r}
+NUM_PATIENTS <- 100
+NUM_STATES <- 30 * 24 * 60 # one state per minute
+PATIENT_STATE <- matrix(numeric(NUM_PATIENTS * NUM_STATES), nrow=NUM_PATIENTS)
+
+```
+
+
+Considering the postures as states, I will make a set of state-transition matrixes. These will depend on how sedentary an individual is, as well as time of day. There will be different matrixes for 
+
+```{r posture_transition_model}
+
+reported_postures <- c(
+   horizontal = 0,
+   upright = 2,
+	 walking = 3,
+	 running = 4,
+	 unknown = 5
+)
+
+simulated_postures <- c("sleeping", "resting", "sitting", "standing", "walking", "running")
+
+posture_mapping <- c(
+  sleeping = 'horizontal',
+  resting = 'horizontal',
+  sitting = 'upright',
+  standing = 'upright',
+  walking = 'walking',
+  running = 'running'
+)
+
+# I won't model "unknown"; postures near transitions will have some probability of being reported "unknown".
+
+active_night <- matrix(c(
+      0.95, 0.05, 0.00, 0.00, 0.00, 0.00, # sleeping
+      0.45, 0.45, 0.10, 0.00, 0.00, 0.00, # resting
+      0.00, 0.30, 0.55, 0.15, 0.00, 0.00, # sitting
+      0.00, 0.00, 0.55, 0.10, 0.45, 0.00, # standing
+      0.00, 0.00, 0.00, 0.75, 0.20, 0.05, # walking
+      0.00, 0.00, 0.00, 0.00, 0.05, 0.95  # running
+    ), nrow=6, byrow=T)
+
+active_day <- matrix(c(
+      0.25, 0.75, 0.00, 0.00, 0.00, 0.00, # sleeping
+      0.05, 0.45, 0.50, 0.00, 0.00, 0.00, # resting
+      0.00, 0.10, 0.55, 0.35, 0.00, 0.00, # sitting
+      0.00, 0.00, 0.25, 0.60, 0.15, 0.00, # standing
+      0.00, 0.00, 0.00, 0.35, 0.50, 0.15, # walking
+      0.00, 0.00, 0.00, 0.00, 0.10, 0.90  # running
+    ), nrow=6, byrow=T)
+
+sedentary_night <- matrix(c(
+      0.95, 0.05, 0.00, 0.00, 0.00, 0.00, # sleeping
+      0.25, 0.45, 0.30, 0.00, 0.00, 0.00, # resting
+      0.00, 0.20, 0.75, 0.05, 0.00, 0.00, # sitting
+      0.00, 0.00, 0.75, 0.10, 0.25, 0.00, # standing
+      0.00, 0.00, 0.00, 0.75, 0.20, 0.05, # walking
+      0.00, 0.00, 0.00, 0.00, 0.95, 0.05  # running
+    ), nrow=6, byrow=T)
+
+sedentary_day <- matrix(c(
+      0.25, 0.75, 0.00, 0.00, 0.00, 0.00, # sleeping
+      0.25, 0.45, 0.30, 0.00, 0.00, 0.00, # resting
+      0.00, 0.20, 0.65, 0.15, 0.00, 0.00, # sitting
+      0.00, 0.00, 0.35, 0.40, 0.15, 0.00, # standing
+      0.00, 0.00, 0.00, 0.55, 0.40, 0.05, # walking
+      0.00, 0.00, 0.00, 0.00, 0.80, 0.20  # running
+    ), nrow=6, byrow=T)
+
+POSTURE_TRANSITION_MATRICES <- list(
+  active = list(
+    day = active_day,
+    night=active_night
+  ),
+  sedentary = list(
+    day = sedentary_day,
+    night=sedentary_night
+  )
+)
+
+next_state <- function(current_state, transition_matrix)
+  which.max(transition_matrix[current_state,] * runif(nrow(transition_matrix)))
+
+```
+
+
+```{r run_state_simulation}
+# Run simulation of states
+
+# The year starts at midnight with everyone asleep
+PATIENT_STATE[,1] <- rep(1, NUM_PATIENTS)
+
+#
+PATIENT_LIFESTYLE <- sample(c("active", "sedentary"), NUM_PATIENTS, replace=TRUE, prob=c(0.45, 0.55))
+PATIENT_CIRCADIAN_ADJUSTMENT <- round(rnorm(NUM_PATIENTS, mean=0, sd=45))
+
+SIM_START_TIME <- as.POSIXct("2016-01-01 00:00:00")
+TIMELINE <- SIM_START_TIME + (1:NUM_STATES) * 60 
+DAY_TIMES <- TIMELINE[1:(24*60)]
+DAY_PART <- ifelse(as.POSIXlt(DAY_TIMES)[['hour']] %in% 7:22, "day", "night")
+
+sim_state <- function(){
+  for (pt in 1:NUM_PATIENTS){
+    pt_tmats <- POSTURE_TRANSITION_MATRICES[[PATIENT_LIFESTYLE[pt]]]
+    for (st in 2:NUM_STATES){
+      shifted_state_idx <- 1 + (st + (PATIENT_CIRCADIAN_ADJUSTMENT[pt] - 1)) %% length(DAY_TIMES)
+      circadian_day_part <- DAY_PART[shifted_state_idx]
+      transmat <- pt_tmats[[circadian_day_part]]
+      PATIENT_STATE[pt, st] <<- next_state(PATIENT_STATE[pt, st-1], transmat)
+    }
+  }
+}
+
+
+```
+
+
+Each patient has a circadian shift, normally distributed with mean 0 and standard deviation 45 minutes. May be easiest to start out everyone the same for a day 
+
+To Do:
+
+Add a mealtime daypart? Also an eating state? It could map to sitting for posture reporting. Other dayparts could also have eating, which would represent snacks. Blood sugar will be a lagging window function over eating states. Meal constituents will vary by individual, and affect blood sugar.

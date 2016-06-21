@@ -1,0 +1,616 @@
+---
+title: "EMR Text Field Simulation"
+author: "Bob Horton"
+date: "Wednesday, April 13, 2016"
+output: html_document
+---
+
+We want to use the information we know about each patient to engineer an "Admitting History" (and eventually a "Discharge Note") for each patient. The goal is to develop materials usable for natural language processing demos.
+
+```{r setup, echo=FALSE}
+DATA_DIR <- "781670.f1"
+diabetes_data <- read.csv(file.path(DATA_DIR, "diabetic_data_initial.csv"), na.strings = c("?", "None"))
+
+# apply metadata from id_mapping.csv
+# make sure all integer levels are covered, so we can just factor the discriptions in order
+category_values <- list(
+admission_source_id = read.csv(text="admission_source_id,description
+1,Physician Referral
+2,Clinic Referral
+3,HMO Referral
+4,Transfer from a hospital
+5,Transfer from a Skilled Nursing Facility (SNF)
+6,Transfer from another health care facility
+7,Emergency Room
+8,Court/Law Enforcement
+9,Not Available
+10,Transfer from critial access hospital
+11,Normal Delivery
+12,Premature Delivery
+13,Sick Baby
+14,Extramural Birth
+15,Not Available
+16,NULL
+17,NULL
+18,Transfer From Another Home Health Agency
+19,Readmission to Same Home Health Agency
+20,Not Mapped
+21,Unknown/Invalid
+22,Transfer from hospital inpt/same fac reslt in a sep claim
+23,Born inside this hospital
+24,Born outside this hospital
+25,Transfer from Ambulatory Surgery Center
+26,Transfer from Hospice"),
+
+discharge_disposition_id = read.csv(text="
+discharge_disposition_id,description
+1,Discharged to home
+2,Discharged/transferred to another short term hospital
+3,Discharged/transferred to SNF
+4,Discharged/transferred to ICF
+5,Discharged/transferred to another type of inpatient care institution
+6,Discharged/transferred to home with home health service
+7,Left AMA
+8,Discharged/transferred to home under care of Home IV provider
+9,Admitted as an inpatient to this hospital
+10,Neonate discharged to another hospital for neonatal aftercare
+11,Expired
+12,Still patient or expected to return for outpatient services
+13,Hospice / home
+14,Hospice / medical facility
+15,Discharged/transferred within this institution to Medicare approved swing bed
+16,Discharged/transferred/referred another institution for outpatient services
+17,Discharged/transferred/referred to this institution for outpatient services
+18,NULL
+19,Expired at home. Medicaid only, hospice.
+20,Expired in a medical facility. Medicaid only, hospice.
+21,Expired, place unknown. Medicaid only, hospice.
+22,Discharged/transferred to another rehab fac including rehab units of a hospital .
+23,Discharged/transferred to a long term care hospital.
+24,Discharged/transferred to a nursing facility certified under Medicaid but not certified under Medicare.
+25,Not Mapped
+26,Unknown/Invalid
+27,Discharged/transferred to a federal health care facility
+28,Discharged/transferred/referred to a psychiatric hospital of psychiatric distinct part unit of a hospital
+29,Discharged/transferred to a Critical Access Hospital (CAH).
+30,Discharged/transferred to another Type of Health Care Institution not Defined Elsewhere
+"),
+
+admission_type_id=read.csv(text="admission_type_id,description
+1,Emergency
+2,Urgent
+3,Elective
+4,Newborn
+5,Not Available
+6,NULL
+7,Trauma Center
+8,Not Mapped")
+)
+
+for (cv_name in names(category_values)){
+  cv <- category_values[[cv_name]]
+  diabetes_data[[cv_name]] <- factor(cv[diabetes_data[[cv_name]],"description"])
+}
+
+```
+
+```{r load_bmi_and_sensor_assignments_data}
+
+SENSOR_ASSIGNMENTS_FILE <- "sim_sensor_assignments.csv"
+sensor_assignments <- read.csv(SENSOR_ASSIGNMENTS_FILE, 
+                               colClasses=c("integer", "character", "factor", "factor"))
+
+BMI_FILE <- "sim_bmi_data.csv"
+bmi_data <- read.csv(BMI_FILE)
+
+# bmi_data$readmitted <- diabetes_data[diabetes_data$patient_nbr==bmi_data$patient_nbr, "readmitted"]
+# with(bmi_data, plot(bmi ~ readmitted))
+```
+
+# Medications
+
+Medication columns have values "Down", "Steady", "Up", or "No", depending on how the dose has changed (if the patient takes this drug).
+
+```{r medications}
+medication_columns <- names(diabetes_data)[25:47]
+lapply(medication_columns, function(col) levels(diabetes_data[[col]]))
+
+drug_matrix <- as.matrix(diabetes_data[medication_columns]) != "No"
+num_diabetes_medications <- rowSums(drug_matrix)
+
+# plot(factor(num_diabetes_medications), diabetes_data$num_medications)
+
+```
+
+
+# Simulation of 'History of Present Illness' and 'Discharge Summary'
+
+Also give patients fake names. This has already been run: patient names are in `patient_table.csv`.
+
+```{r history_present_illness, eval=FALSE}
+guess_age <- function(age_cat, seed=123){
+  set.seed(seed)
+  library(dplyr)
+  age_cat %>% as.character %>% 
+    (function(label) substr(label, 2, nchar(label) - 1)) %>%
+    strsplit('-') %>% lapply(as.integer) %>% 
+    lapply(function(v) sample(seq(v[1], v[2]-1), 1)) %>%
+    unlist
+}
+
+# # Deprecated; use "pick_baby_names"
+# pick_baby_name <- function(sex, yob, seed=123){
+#   # to do: vectorize to get a set of names for a given sex and age
+#   set.seed(seed)
+#   library(babynames)
+#   name_rnd <- runif(1)
+#   if (yob > max(babynames$year)) yob <- max(babynames$year)
+#   candidates <- babynames[babynames$year==yob & babynames$sex == sex,]
+#   cum_frac <- cumsum(candidates$n)/sum(candidates$n)
+#   candidates[1 + sum(cum_frac < name_rnd), ]$name
+# }
+
+pick_baby_names <- function(sex_vec, yob_vec, seed=123){
+  # vectorized: gets a set of names given sex and age vectors
+  sex_vec <- factor(sex_vec)
+  set.seed(seed)
+  library(babynames)
+  yob_vec[yob_vec > max(babynames$year)] <- max(babynames$year)
+  yob_vec[yob_vec < min(babynames$year)] <- min(babynames$year)
+  name_vec <- character(max(length(sex_vec), length(yob_vec)))
+  for (sex in levels(sex_vec)){
+    for (yob in unique(yob_vec)){
+      positions <- sex_vec==sex & yob_vec==yob
+      N <- sum(positions)
+      candidates <- babynames[babynames$year==yob & babynames$sex == sex,]
+      choices <- sample(candidates$name, N, replace=TRUE, prob=candidates$n)
+      name_vec[positions] <- choices
+    }
+  }
+  name_vec
+}
+
+# # Deprecated; use "get_surnames"
+# get_surname <- function(N, seed=123){
+#   # to do: vectorize to get a set of surnames (for a given race)
+#   set.seed(seed)
+#   surnames <- read.delim("Hx/us_surnames.tsv", stringsAsFactors=FALSE)
+#   # from https://en.wikipedia.org/wiki/List_of_most_common_surnames_in_North_America#United_States_.28American.29
+#   surnames <- surnames[order(surnames$Rank),]
+#   surnames <- transform(surnames, count=as.integer(gsub(',', '', as.character(Total.number))))
+#   pop_size <- sum(surnames$count)
+#   surnames$pop_fraction <- surnames$count/pop_size
+#   surnames$cum_fraction <- cumsum(surnames$pop_fraction)
+#   surname_rnd <- runif(N)
+#   surname_idx <- sapply(surname_rnd, function(sr) 1 + sum(surnames$cum_fraction < sr))
+#   surnames$Name[surname_idx]
+# }
+
+get_surnames <- function(race_vec, seed=123){
+  # vectorized to get a set of surnames (for a given race)
+  set.seed(seed)
+  race_vec[is.na(race_vec)] <- "Other"
+  surnames <- read.delim("Hx/us_surnames.tsv", stringsAsFactors=FALSE)
+  # from https://en.wikipedia.org/wiki/List_of_most_common_surnames_in_North_America#United_States_.28American.29
+  names(surnames)[8:13] <- c("Caucasian", "AfricanAmerican", "Asian", "NativeAmerican", "Other", "Hispanic")
+  surname_vec <- character(length(race_vec))
+  
+  for (race in race_vec){
+    positions <- race_vec == race
+    N <- sum(positions)
+    surname_vec[positions] <- with(surnames, sample(Name, N, replace=TRUE, prob=surnames[[race]]))
+  }
+  
+  surname_vec
+}
+
+# diabetes_data[c("weight", "bmi")] <- bmi_data[bmi_data$patient_nbr==diabetes_data$patient_nbr, c("weight", "bmi")]
+# diabetes_data$age <- guess_age(diabetes_data$age)
+# 
+# # diabetes_data$first_name <- mapply(pick_baby_name, ifelse(diabetes_data$gender=="Female", "F", "M"), 2016 - diabetes_data$age)
+# rxOptions(numCoresToUse=4)
+# rxSetComputeContext("localpar")
+# first_name <- rxExec(pick_baby_name, rxElemArg(ifelse(diabetes_data$gender=="Female", "F", "M")), rxElemArg(2016 - diabetes_data$age))
+# 
+# diabetes_data$first_name <- unlist(first_name)
+# diabetes_data$last_name <- get_surname(nrow(diabetes_data))
+# 
+# saveRDS(diabetes_data, file="decorated_diabetes_data.rds")
+
+patient_surnames <- get_surnames(diabetes_data$race); saveRDS(patient_surnames, "patient_surnames.Rds")
+sex_vec <- ifelse(diabetes_data$gender=="Female", "F", "M")
+age_vec <- guess_age(diabetes_data$age)
+# yob_vec <- 2016 - age_vec
+# now <- as.Date(Sys.time())
+
+discharge_date <- as.Date(sensor_assignments$discharge_time)
+
+birthdates <- discharge_date - 365.24*age_vec - sample(0:364, length(age_vec), replace=TRUE)
+age2 <- floor(as.integer(discharge_date - birthdates)/365.24)
+hist(age2 - age_vec) # very rarely off by one
+
+yob <- format(birthdates, format="%Y")
+patient_firstnames <- pick_baby_names(sex_vec, yob)
+
+patient_personal <- data.frame(
+  patient_nbr = diabetes_data$patient_nbr,
+  firstname=patient_firstnames,
+  lastname=patient_surnames,
+  dob = birthdates
+)
+
+# We just made one person record per encounter. But since patients can have multiple encounters, we should have only one person record per patient_nbr.
+patient_table <- patient_personal[!duplicated(patient_personal$patient_nbr),]
+
+write.csv(patient_table, file="patient_table.csv", row.names=FALSE)
+
+```
+
+
+```{r}
+patient_table <- read.csv(file="patient_table.csv", stringsAsFactors=FALSE)
+rownames(patient_table) <- patient_table$patient_nbr
+
+# http://stackoverflow.com/questions/3611314/calculating-ages-in-r, by Jim
+age = function(from, to) {
+  from_lt = as.POSIXlt(from)
+  to_lt = as.POSIXlt(to)
+
+  age = to_lt$year - from_lt$year
+
+  ifelse(to_lt$mon < from_lt$mon |
+         (to_lt$mon == from_lt$mon & to_lt$mday < from_lt$mday),
+         age - 1, age)
+}
+
+decorate_diabetes_data <- function(d_data, pt_tbl, bmi_dat, sensor_assign){
+  # add first_name, last_name, weight, bmi, and numeric age
+  d_data[c("height", "weight", "bmi")] <- bmi_dat[bmi_dat$patient_nbr==d_data$patient_nbr, 
+                                                   c("height", "weight", "bmi")]
+  d_data[c("first_name", "last_name", "dob")] <- pt_tbl[as.character(d_data$patient_nbr), 
+                                                        c("firstname", "lastname", "dob")]
+  
+  d_data$discharge_time <- sensor_assign[sensor_assign$encounter_id==d_data$encounter_id, "discharge_time"]
+  
+  d_data$age <- with(d_data, {
+    discharge <- as.Date(discharge_time) # %>% ymd
+    dob <- dob # %>% ymd
+    age(dob, discharge)
+  })
+  
+  d_data
+}
+    # floor((as.Date(discharge_time) - as.Date(dob))/365.24)
+    # library(lubridate)
+    # library(dplyr)
+    # discharge <- as.Date(discharge_time) %>% ymd
+    # dob <- dob %>% ymd
+    # age(dob, discharge)
+    ## Bug in lubridate: interval 1964-02-29 UTC--2016-02-27 UTC breaks period(., unit="year")
+    ## my_interval <- as.interval(ymd("2016-02-27") - ymd("1964-02-29"), start=ymd("1964-02-29"))
+    ## as.period(my_interval, unit="month") # this works
+    ## as.period(my_interval, unit="year") # error
+    
+    #     as.interval(discharge - dob, dob) %>% 
+    #       as.period(unit="year") %>% 
+    #       as.character %>% 
+    #       gsub("y.*$", "", .)
+    
+    # unit="month",  %>% "/"(12) fails on different cases, 
+
+decorated_diabetes_data <- decorate_diabetes_data(diabetes_data, patient_table, bmi_data, sensor_assignments)
+
+```
+
+
+# Admitting History and Physical
+
+See more examples (here)[https://www.med.unc.edu/medselect/resources/sample-notes].
+
+See this example of a (discharge summary)[http://clerkship.medicine.ufl.edu/portfolio/interpersonal-and-communicative-skills/discharge-summarytransfer-noteoff-service-note-instructions/].
+
+```{r}
+# encounter_record <- diabetes_data[which.max(num_diabetes_medications),]
+
+sim_history_present_illness <- function(dd_data){
+  with(dd_data, {
+    
+      nominative_pronoun <- ifelse(gender=="Female", "she", "he")
+      posessive_pronoun <- ifelse(gender=="Female", "her", "his")
+      sex <- ifelse(gender=="Female", ifelse(age < 18, "girl", "woman"), ifelse(age < 18, "boy","man"))
+      
+      er_use <- cut(number_emergency, breaks=c(0, 1, 10, 20, 30, Inf), 
+                    labels=c("has never been", "is occasionally", "is frequently", 
+                             "is very often", "is constantly being"), include_lowest=TRUE)
+      
+      get_er_variant <- function(N) 
+                          sample(c("emergency room", "ER", "emergency department", "ED"), N, replace=TRUE)
+      er_variant <- get_er_variant(length(er_use))
+      er_use_clause <- paste(nominative_pronoun, er_use, er_variant, ".")
+
+      weight_category <- cut(bmi, breaks=c(0, 18.5, 25, 30, 35, 40, 50, Inf), 
+                             labels=c("underweight", "normal weight", "overweight", 
+                                      "mildly obese", "moderately obese", 
+                                      "severely obese", "super obese"), include.lowest=TRUE)
+
+      basis_clause <- ifelse(admission_type_id %in% c("Elective", "Emergency", "Urgent"), 
+             paste("on an", tolower(admission_type_id), "basis"), "")
+      
+      er_variant2 <- get_er_variant(length(er_use))
+      
+      admission_source_clause <- ifelse(admission_source_id %in% 
+                                          c("Clinic Referral", "Transfer from another health care facility", 
+                                            "Transfer from a hospital", "Physician Referral"), 
+                                        paste("as a", tolower(admission_source_id), basis_clause), 
+                                        ifelse(admission_source_id == "Emergency Room", paste("from the", er_variant2), ''))
+
+      levels(medical_specialty) <- gsub("([a-z])([A-Z])", "\\1 \\2", 
+                                        gsub("([a-z])(with|and)","\\1 \\2", 
+                                             gsub("-", " ", levels(medical_specialty))), perl=TRUE)
+      medical_specialty_clause <- paste("admitted to", 
+                                        ifelse(is.na(medical_specialty), 
+                                               'the hospital', 
+                                               paste("the", tolower(medical_specialty), "service")))
+      
+      hpi1 <- paste("This is a", age, "year old", weight_category, race, sex, medical_specialty_clause, admission_source_clause, ".")
+      
+      history_present_illness <- gsub("\\s+", " ", gsub(" \\.", ".", hpi1))
+      
+      history_present_illness
+  })
+}
+
+sim_medications <- function(dd_data){
+  # Count individual components of combination meds
+  medication_columns <- names(diabetes_data)[25:47]
+  get_medications <- function(encounter_table){
+    lapply(1:nrow(encounter_table), function(i){
+        meds <- medication_columns[encounter_table[i, medication_columns] != "No"]
+        meds <- unique(unlist(strsplit(meds, "\\.")))
+        meds
+      }
+    )
+  }
+  medications <- sapply(get_medications(dd_data), function(meds) paste(meds, collapse="\n\t*"))
+  sapply(medications, function(meds) if (""==meds) "NONE" else paste0("\n\t*", meds))
+}
+
+sim_assessment <- function(dd_data){
+  ICD9_DIR <- "ICD-9-CM-v32-master-descriptions"
+  icd9_dx <- read.csv(file.path(ICD9_DIR, "CMS32_DESC_LONG_SHORT_DX.csv"), 
+                      colClasses=rep("character", 4)) #stringsAsFactors=FALSE
+  
+  # ICD9 codes are represented without decimal points in the lookup table. 
+  # Leading zeros are significant, but they are missing in our dataset. Some trailing zeros are missing as well.
+  # Eg, (04110 and 4110), (01570 and 1570) are different codes. So I have to guess in some cases.
+  lookup_icd9_dx <- function(icd9){
+    codes <- levels(icd9)[icd9]
+    nums <- grepl("\\.", codes)  # !grepl("^[EV]", codes) & !is.na(codes)
+    codes[nums] <- as.character(as.numeric(codes[nums]) * 100)
+    names(codes) <- codes
+    key <- gsub("^0+", "", icd9_dx$`DIAGNOSIS.CODE`)
+    vsubs <- grep("V.+00$", icd9_dx$DIAGNOSIS.CODE, value=TRUE)
+    names(vsubs) <- gsub("00$","",vsubs)
+    substitutions <- c(E909="E9090", '411'="4110", vsubs)
+    lapply(names(substitutions), function(n) codes[codes==n] <- substitutions[n])
+    res <- sapply(codes, function(code) icd9_dx$LONG.DESCRIPTION[which(key==code)])
+    # guess again by appending one 0 to the codes with missing values
+    missing <- sapply(res, length)==0
+    codes[missing] <- paste0(codes[missing], "0")
+    res <- sapply(codes, function(code) icd9_dx$LONG.DESCRIPTION[which(key==code)])
+    # guess yet again on missing values by appending yet another 0
+    missing <- sapply(res, length)==0
+    codes[missing] <- paste0(codes[missing], "0")
+    sapply(codes, function(code){ 
+      v <- icd9_dx$LONG.DESCRIPTION[which(key==code)]
+      v[length(v)]  # if there are multiple matches, return the last one (because 411 maps to 4110 not 04110)
+    })
+  }
+  
+  icd9_matrix <- cbind (
+    lookup_icd9_dx(dd_data$diag_1),
+    lookup_icd9_dx(dd_data$diag_2),
+    lookup_icd9_dx(dd_data$diag_3)
+  )
+  
+  diagnoses <- apply( icd9_matrix, 1, paste, collapse="\n\r*" )
+  
+  with(dd_data,
+    ifelse (number_diagnoses > 3, paste(diagnoses, sprintf("\n\r* and %d others", number_diagnoses - 3)), diagnoses)
+  )
+}
+
+sim_physical_exam <- function(dd_data){
+  N <- nrow(dd_data)
+  #VITAL SIGNS: Weight 175.2 pounds which is 79.3 kg, blood pressure 142/96 by the nurse, 140/92 by me, pulse is 64.
+  template <- "Vital signs: blood pressure %d/%d, pulse %d, respiratory rate %d, weight %0.1f %s, height %s, BMI %d."
+  bp_systolic <- round(rnorm(N, mean=120, sd=15))
+  bp_diastolic <- round(rnorm(N, mean=75, sd=10))
+  pulse <- round(rnorm(N, mean=80, sd=10))
+  respirarory_rate <- round(rnorm(N, mean=18, sd=3))
+  weight_units <- sample(c("kg", "kilograms", "lb", "pounds"), N, replace=TRUE)
+  with(dd_data,{
+    weight[is.infinite(weight)] <- NA
+    bmi[is.infinite(bmi)] <- NA
+    reported_weight <- ifelse (weight_units %in% c("lb", "pounds"), weight * 2.2, weight)
+    # height <- sqrt(weight/bmi) # in meters
+    reported_height <- sprintf("%dft %din", floor(39.3701 * height/12), round((39.3701 * height) %% 12))
+    sprintf(template, bp_systolic, bp_diastolic, pulse, respirarory_rate, reported_weight, weight_units, reported_height, round(bmi))
+  })
+}
+
+sim_admitting_history <- function(dd_data){
+  template <- "## History of present illness\n%s
+
+## Physical Exam\n%s
+
+## Medications\n%s
+
+## Assessment\n%s
+
+"
+  sprintf( template, 
+    sim_history_present_illness(dd_data),
+    sim_physical_exam(dd_data),
+    sim_medications(dd_data),
+    sim_assessment(dd_data)
+  )
+}
+
+sim_discharge_summary <- function(dd_data){
+  with(dd_data,{
+    
+    discharge_disposition <- as.character(discharge_disposition_id)
+    
+    gender_title <- ifelse(gender=="Female", "Ms.", "Mr.")
+    this_hospital_phrase <- sample(c("in this facility", "in the hospital", "under our care"), 
+                                   nrow(dd_data), replace=TRUE)
+    substring(discharge_disposition, 1) <- tolower(substring(discharge_disposition, 1))
+    joiner <- ifelse(grep("^(admitted|discharged)", discharge_disposition), "was", 
+              ifelse(grep("hospice", discharge_disposition), "was transfered to", ""))
+   
+    sprintf("After %d days %s, %s %s %s %s.", 
+            time_in_hospital, this_hospital_phrase, 
+            gender_title, last_name, joiner, discharge_disposition)
+  })
+}
+
+## Discharge Summary\n%s
+# if(length(ds <- sim_discharge_summary(dd_data)) == 0) "None" else ds
+
+```
+
+```{r debug_sim_admitting_history}
+# try processing blocks; some will fail, but this is a fast way to do the rest
+N <- nrow(decorated_diabetes_data)
+hx <- character(N)
+block_size <- 1000
+for (k in 1:floor(N/block_size)){
+  i <- block_size * (k-1) + 1
+  rng <- i:(i+(block_size-1))
+  print(sprintf("block from %d to %d\n", rng[1], rng[block_size]))
+  hx[rng] <- tryCatch(sim_admitting_history(decorated_diabetes_data[rng,]), error=function(e) NA)
+}
+rng <- (i + block_size):N
+print(sprintf("last few from %d to %d\n", min(rng), max(rng)))
+hx[rng] <- tryCatch(sim_admitting_history(decorated_diabetes_data[rng,]), error=function(e) NA)
+
+# plot(is.na(hx), pch='.')
+sum(is.na(hx))
+
+for (i in which(is.na(hx))){
+  tryCatch({
+      print(sprintf("i = %d\n", i))
+      if (is.na(hx[i])) hx[i] <- sim_admitting_history(decorated_diabetes_data[i,])
+    },
+    error = function(e){NA}
+  )
+}
+
+# plot(is.na(hx), pch='.')
+sum(is.na(hx)) # 14
+redo <- which(is.na(hx))
+
+
+decorated_diabetes_data[redo,]
+# All have infinite weight (and bmi).
+# BUT not all records with infinite weight ended up on redo list.  (1019 total)
+
+md2html <- function(markdown_vec){
+  library(markdown)
+  library(dplyr)
+  html_vec <- sapply(markdown_vec, function(txt){
+    if (is.na(txt) || length(txt) == 0 || txt == ""){
+      ""
+    } else {
+        renderMarkdown(text=txt) %>% 
+              gsub("\\n", "<br />", .) %>%
+              gsub("\\t", "    ", .)
+    }
+  })
+  unname(html_vec)
+}
+
+hx_html <- md2html(hx)
+admitting_history <- data.frame(encounter_id = decorated_diabetes_data$encounter_id, hx=hx_html, stringsAsFactors=FALSE)
+write.table(admitting_history, "admitting_history.csv", sep=",", row.names=FALSE, col.names=FALSE)
+
+# admitting_history <- read.table("admitting_history.csv", sep=",", col.names=c("encounter_id", "hx"), stringsAsFactors=FALSE)
+
+sample_history <- rbind(admitting_history[1:100,], admitting_history[redo[1],])
+# 100 normal, and 1 NA
+write.table(sample_history, "sample_history.csv", sep=",", row.names=FALSE, col.names=TRUE)
+
+```
+
+
+## Extract weight in kilograms from text
+
+```{r extract_weight}
+extract_weight_in_kg <- function(txt){
+  pat <- "Vital signs:[^\\n<]+weight ?([0-9\\.]+) ?(kg|kilo|kilogram|lb|pound)"
+  matches <- regexec(pat, txt, ignore.case=TRUE)
+  
+  get_matches <- function(match, src)
+    substring(src, first=match, last=match + attr(match, "match.length"))
+  
+  M_list <- mapply(get_matches, matches, txt, SIMPLIFY=FALSE) # I'll simplify it myself, thank you
+  M <- do.call("cbind", lapply(M_list, function(v) v[1:3]))
+  
+  val <- as.numeric(M[2,])
+  unit <- ifelse(substr(M[3,],1,1) == 'k', 1, 1/2.20462)
+  
+  val * unit
+}
+
+wt_in <- decorated_diabetes_data$weight
+wt_out <- extract_weight_in_kg(hx) # takes about 6 seconds
+plot(wt_in, wt_out, pch='.')
+hist(wt_in/wt_out, breaks=100)
+sum(is.na(wt_in)) #3
+sum(is.na(wt_out)) # 1037
+
+# hx[vanished[1:1]] "weight Inf kilograms"
+```
+
+# To Do for Next Iteration
+
+## Adding Symptoms
+
+I have not found a perfetly suitable open source database of symptoms to accompany ICD9 diagnoses, but the body system indicators from the (HCUPS Chronic Condition Indicator)[https://www.hcup-us.ahrq.gov] database may be helpful:
+
+```{r symptoms}
+body_system_indicator_category <- c(
+  '1' = 'Infectious and parasitic disease',
+	'2' = 'Neoplasms',
+	'3' = 'Endocrine, nutritional, and metabolic diseases and immunity disorders',
+	'4' = 'Diseases of blood and blood-forming organs',
+	'5' = 'Mental disorders',
+	'6' = 'Diseases of the nervous system and sense organs',
+	'7' = 'Diseases of the circulatory system',
+	'8' = 'Diseases of the respiratory system',
+	'9' = 'Diseases of the digestive system',
+	'10' = 'Diseases of the genitourinary system',
+	'11' = 'Complications of pregnancy, childbirth, and the puerperium',
+	'12' = 'Diseases of the skin and subcutaneous tissue',
+	'13' = 'Diseases of the musculoskeletal system',
+	'14' = 'Congenital anomalies',
+	'15' = 'Certain conditions originating in the perinatal period',
+	'16' = 'Symptoms, signs, and ill-defined conditions',
+	'17' = 'Injury and poisoning',
+	'18' = 'Factors influencing health status and contact with health services'
+)
+
+cci <- read.csv("Hx/cci2015.csv", skip=1)
+# category descriptions: chronic (1) versus not chronic (0)
+
+
+```
+
+### HCUPS ICD9 Keys
+
+* Alphanumeric diagnosis codes must be left-justified.
+* Two spaces must always follow a 3-character diagnosis code.
+* One space must always follow a 4-character diagnosis code.
+* Trailing blanks should never be zero-padded (i.e., blank spaces following a 3-character diagnosis code should not be filled with zeroes).
+* Leading zeroes must be preserved; they are significant.

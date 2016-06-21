@@ -1,0 +1,426 @@
+---
+title: "Simulating Diabetes Readmission Data"
+author: "Bob Horton"
+date: "Tuesday, March 22, 2016"
+output: html_document
+---
+
+
+# Plan
+*  Create multiple data sources for this dataset:
+  + SQL Server: EMR tables
+  + Blob on AWS: CGMS data
+  + Hadoop on Azure IaaS: sensor data for vital signs
+  + Excel: assignment of sensors to patients
+*	Ingest data every 5 minutes using ADF
+	+ Create synthetic data every 5 minutes and push to files above 
+*	Store data by time on Azure Data Lake
+*	Build ML model for prediction 
+*	Expose the ML end point service
+*	Create Power BI reports on various descriptive stats
+	+ Correlation between Age and readmission
+	+ Gender and readmission 
+	+ If a medication has any association to readmission
+*	WebApp that shows as the data is entered in the EMR during a discharge the probability of readmission of the patient using the ML Scoring API
+
+# Characterizing data from the paper
+
+This is a simulation of patient readmission for diabetes, based on [this paper](http://www.hindawi.com/journals/bmri/2014/781670/):
+
+> Strack B, DeShazo JP, Gennings C, Olmo JL, Ventura S, Cios KJ, Clore JN.
+> Impact of HbA1c measurement on hospital readmission rates: analysis of 70,000
+> clinical database patient records. _Biomed Res Int_ 2014;2014:781670.
+
+This work is also described in [this blog post](http://tyokogawa.github.io/blog/Patient_readmission_prediction/)
+Apparently there are also some [models in Azure ML](https://gallery.cortanaanalytics.com/browse?s=diabetes) on this topic.
+
+First let's examine the general relationships among the variables in the dataset and consider how to reverse engineer a set of patient EMR and laboratory records that could be aggregated into a table similar to this one. We will also explore adding other data sources and relating them to readmission.
+
+```{r setup, echo=FALSE, cache=TRUE}
+DATA_DIR <- "781670.f1"
+diabetes_data <- read.csv(file.path(DATA_DIR, "diabetic_data_initial.csv"), na.strings = c("?", "None"))
+
+```
+
+```{r admission_sources}
+# Top admission types
+head(rev(sort(table(diabetes_data$admission_type_id))))
+
+# Top admission sources
+head(rev(sort(table(diabetes_data$admission_source_id))))
+
+# Top discharge dispositions
+head(rev(sort(table(diabetes_data$discharge_disposition_id))))
+
+# A small number of patients keep getting readmitted
+library(dplyr)
+diabetes_data$patient_nbr %>% table %>% sort %>% rev %>% plot
+```
+
+Variable importance from quick and dirty random forest model:
+
+```{r variable_importance, echo=FALSE, cache=TRUE}
+rxOptions(reportProgress=0)
+dot_formula <- function(vars, outcome, exclude=NULL){ 
+  vars <- setdiff(vars, exclude)
+  formula(paste(outcome, paste(setdiff(vars, outcome), collapse='+'), sep='~'))
+}
+
+# Exclude variables that cause trouble. 
+# Diagnoses are too high cardinality, some drugs have insufficient variability.
+exclude_me <- c("examide", "citoglipton", "medical_specialty", 'diag_1', 'diag_2', 'diag_3')
+exclude_me <- exclude_me[-1]
+# The variance is zero for the variable(s): "citoglipton" which are eliminated for further analysis.
+
+form <- dot_formula(names(diabetes_data), "readmitted", exclude_me)
+fit <- rxDForest(form, diabetes_data, importance=TRUE, verbose=0)
+rxVarImpPlot(fit)
+```
+
+Note that both `patient_nbr` and `encounter_id` are very informative. If patients are re-numbered when they are re-admitted; this might explain why patients readmitted after longer times tend to have higher numbers. Similar logic may account for the association with `encounter_id`. 
+
+You get the numbers fof variable importance like this:
+
+```{r rxVarUsed}
+rev(sort(rxVarUsed(fit)))
+```
+
+```{r patient_numbering}
+with(diabetes_data, plot(patient_nbr ~ readmitted))
+with(diabetes_data, plot(encounter_id ~ readmitted))
+
+```
+
+```{r variable_viz, results='asis'}
+with(diabetes_data,{
+  hist(number_inpatient)
+  hist(number_emergency, breaks=seq(0, max(number_emergency)))
+  hist(number_diagnoses, breaks=seq(0, max(number_diagnoses)))
+  hist(number_outpatient, breaks=seq(0, max(number_outpatient)))
+  hist(num_medications, breaks=seq(0, max(num_medications)))  #
+  hist(num_lab_procedures, breaks=seq(0, max(num_lab_procedures))) #
+})
+
+for (tabulate_me in c("diabetesMed", "readmitted")){
+  cat(sprintf("## %s\n", tabulate_me))
+  print(table(diabetes_data[[tabulate_me]]))
+}
+
+with(diabetes_data,{
+  xtabs(~ max_glu_serum + A1Cresult)
+})
+
+library(ggplot2)
+ggplot(diabetes_data[diabetes_data$gender %in% c("Female", "Male"),], aes(x=num_age, col=readmitted)) + geom_density() + facet_grid(race ~ gender)
+```
+```{r diagnosis_columns}
+for (diag_col in sprintf("diag_%d", 1:3)){
+  cat(sprintf('## %s\n', diag_col))
+  diagnosis_column <- head(rev(sort(table(as.factor(diabetes_data[[diag_col]])))), n=10)
+  print(data.frame(OCD9=names(diagnosis_column), count=diagnosis_column, row.names=NULL))
+  # print(diagnosis_column)
+  cat("\n")
+}
+```
+
+# Relationships to outcome
+
+```{r outcome_associations}
+with(diabetes_data,{
+  t(xtabs(~ readmitted + discharge_disposition_id))
+})
+
+```
+
+# Simulated data
+
+Simulated data will be added to the patient information in such a way that knowing the additional information will allow us to make somewhat better predictions of the likelihood of readmission. There will be five kinds of new data:
+
+* wearable vital sign sensor data
+* continuous glucose monitoring system (CGMS) measurements
+* Body Mass Index (BMI)
+* Demographic influences (zipcode)
+* Purchase histories (grocery lists)
+
+These new data sources are secretly driven by hidden 'secret activity level' variables. The value of these hidden variables are assigned to patients in such a way that those who ended up being readmitted to the hospital tend to be assigned to lower activity levels. Each of these hidden variables has independent noise, so that the more of the ou know, the better your predictions can be.
+
+For example, people with more active lifestyles are assigned a lower BMI on average. The activity level drives activity states in a Markov simulation, which in turn drives both the wearable sensor simulation and the CGMS values. Activity level is reflected in the vital sign sensor data, so that a variety of attributes (such as time spent walking or standing) will have predictive value for readmission. In the glucose simulation, the various activities help to use up glucose, so the patterns of glucose levels will vary by activity level. But the real signal in the glucose measurements is in the variance of the measurements; the secret variable 
+
+The sensor readings, BMI information, and CGMS data each provide a way to make statistical inferences about their respective secret activity level, so including all of these sources in an analysis will lead to better predictions of readmission. Each reflects a separate version of the `secret activity level` with its own randomness added, so that considering all three together should give better information than any alone.
+
+sal1: activity model -> vital signs sensor readings and CGMS peak locations
+sal2: CGMS variance
+sal3: BMI
+sal4: zip code
+sal5: grocery list
+
+```{r activity_level}
+SECRET_ACTIVITY_LEVEL_FILE <- "sim_secret_activity_levels.csv"
+RECALCULATE_SECRET_ACTIVITY_LEVELS = FALSE
+if (RECALCULATE_SECRET_ACTIVITY_LEVELS){
+  mean_activity_level <- c(0.25, 0.50, 0.70)
+  # c(`<30`=0.25, `>30`=0.50, `NO`=0.70)
+  names(mean_activity_level) <- levels(diabetes_data$readmitted)
+  # "<30" ">30" "NO"
+  
+  # secret activity level
+  
+  sal1 <- rnorm(nrow(diabetes_data), mean=mean_activity_level[diabetes_data$readmitted], sd=0.12)
+  sal1[sal1 < 0] <- 0
+  sal1[sal1 > 1] <- 1
+  
+  sal2 <- rnorm(nrow(diabetes_data), mean=mean_activity_level[diabetes_data$readmitted], sd=0.12)
+  sal2[sal2 < 0] <- 0
+  sal2[sal2 > 1] <- 1
+  
+  sal3 <- rnorm(nrow(diabetes_data), mean=mean_activity_level[diabetes_data$readmitted], sd=0.12)
+  sal3[sal3 < 0] <- 0
+  sal3[sal3 > 1] <- 1
+
+  sal4 <- rnorm(nrow(diabetes_data), mean=mean_activity_level[diabetes_data$readmitted], sd=0.12)
+  sal4[sal4 < 0] <- 0
+  sal4[sal4 > 1] <- 1
+
+  sal5 <- rnorm(nrow(diabetes_data), mean=mean_activity_level[diabetes_data$readmitted], sd=0.12)
+  sal5[sal5 < 0] <- 0
+  sal5[sal5 > 1] <- 1
+
+  hist(sal1, breaks=100)        
+  
+  secret_activity_levels <- data.frame(sal1, sal2, sal3, row.names=diabetes_data$encounter_id)
+  write.csv(secret_activity_levels, file=SECRET_ACTIVITY_LEVEL_FILE)
+}
+
+secret_activity_levels <- read.csv(SECRET_ACTIVITY_LEVEL_FILE, row.names=1)
+```
+
+### Visualizing latent activity level variables
+
+Each of the "secret activity level" variables (`sal1` through `sal1`) is related to the outcome, so they are related to each other. Using inputs related to all three should give better predictions than if one or more of these latent variables are not related to model inputs.
+
+```{r secret_activity_levels_viz}
+rbow <- rainbow(32, end=2/3)
+with(secret_activity_levels, plot(sal1, sal2, pch='.', col=rbow[1+ceiling(sal3 * 31)]))
+
+```
+
+## Body Mass Index
+
+BMI is a function of height and weight. The desired BMI will be a latent variable assigned to each patient based on one of the activity level variables. since patients who were readmitted will tend to be assigned to lower activity levels, they will tend to have higher BMIs. Height is generated from geneder-specific random distributions and added to the EMR, then we calculate the weight we need to give the patient to achieve the desired BMI. 
+
+The weight value will be embedded into a text field in the EMR (probably the admission summary).
+
+~[UK_BMI](http://image.slidesharecdn.com/vid17667slidesforwebsiteadultdec2013-121227022947-phpapp01/95/uk-obesity-data-data-for-the-adult-population-20-8-638.jpg?cb=1356575520)
+
+
+```{r bmi_calculations}
+BMI_FILE <- "sim_bmi_data.csv"
+
+RECALCULATE_BMI <- FALSE
+
+if (RECALCULATE_BMI){
+  set.seed(123)
+  bmi <- function(wt_kg, ht_m) wt_kg / (ht_m ^ 2)
+  
+  # parameters of gender-specifi negative binomial distributions approximating the BMI distributions
+  size_bmi <- c(Female=30, Male=600)
+  mu_bmi <- c(Female=25, Male=26)
+  
+  # visualize the gender-specific BMI distributions
+  x <- seq(11,50)
+  plot(x, dnbinom(x, size=size_bmi['Female'], mu=mu_bmi['Female']), type='l', 
+       ylim=c(0,0.08), xlab="BMI", ylab="frequency")
+  lines(x, dnbinom(x, size=size_bmi['Male'], mu=mu_bmi['Male']), col="blue")
+  
+  # assign gender-appropriate BMIs to all patients based on their sal3 value
+  sex <- diabetes_data$gender
+  sal3 <- secret_activity_levels$sal3
+  
+  # generate sal3 quantiles by sampling
+  # sal3_quantiles <- quantile(sal3, probs=0:1000/1000)
+  
+  # generate quantiles using quantile function of the negative binomial distribution
+  bmi_quantiles <- list("Female"=qnbinom(p=1:100/100, size=size_bmi['Female'], mu=mu_bmi['Female']),
+                         "Male" = qnbinom(p=1:100/100, size=size_bmi['Male'],   mu=mu_bmi['Male']))
+  plot(bmi_quantiles[['Female']], main="Female BMI quantiles")
+  plot(bmi_quantiles[['Male']], main="Male BMI quantiles")
+  
+  # map the sal3 quantiles to bmi quantiles for each gender.
+  map2q100s <- function(v, quantile_value_out){
+    quantile_in <- cut(v, breaks=quantile(v, prob=0:100/100), labels=paste0((1:100)/10, "%"), include.lowest=T)
+    quantile_value_out[quantile_in]
+  }
+  
+  bmi <- numeric(length(sal3))
+  bmi[sex=="Female"] <- map2q100s(sal3[sex=="Female"], rev(bmi_quantiles[['Female']]))
+  bmi[sex=="Male"] <- map2q100s(sal3[sex=="Male"], rev(bmi_quantiles[['Male']]))
+  
+  # add a bit of jitter
+  bmi <- bmi + round(rnorm(length(bmi), sd=1), digits=2)
+  
+  # assign heights to patients (may be used in multiple encounters)
+  mean_height <- c(Female=63.7, Male=69.1) * 0.0256 # height in meters
+  sd_height <- c(Female=2.7, Male=2.9) * 0.0256
+  
+  male_ids <- unique(diabetes_data$patient_nbr[sex=="Male"])
+  male_height <- rnorm(length(male_ids), 
+                        mean=mean_height['Male'], 
+                        sd=sd_height['Male'])
+  names(male_height) <- male_ids
+  
+  female_ids <- unique(diabetes_data$patient_nbr[sex=="Female"])
+  female_height <- rnorm(length(female_ids), 
+                        mean=mean_height['Female'], 
+                        sd=sd_height['Female'])
+  names(female_height) <- female_ids
+  
+  patient_height <- numeric(length(bmi))
+  patient_height[sex=="Male"] <- male_height[as.character(diabetes_data$patient_nbr[sex=="Male"])]
+  patient_height[sex=="Female"] <- female_height[as.character(diabetes_data$patient_nbr[sex=="Female"])]
+  
+  patient_height[patient_height==0] <- NA
+  
+  bmi_data <- data.frame(
+    encounter_id = diabetes_data$encounter_id,
+    patient_nbr = diabetes_data$patient_nbr,
+    gender = sex,
+    height = patient_height,
+    bmi = bmi,
+    weight = bmi * (patient_height^2)
+  )
+  
+  write.csv(bmi_data, file=BMI_FILE, row.names=FALSE)
+}
+
+bmi_data <- read.csv(BMI_FILE)
+
+bmi_data$readmitted <- diabetes_data[diabetes_data$encounter_id==bmi_data$encounter_id, "readmitted"]
+plot(bmi ~ readmitted, bmi_data)
+
+```
+
+Note that heights were assigned to patients, but BMIs were assigned to encounters. This means a patient's weight can change (dramatically!) between hospital admissions. Someday I might average the weights, but not this iteration.
+
+## Wearable vital sign sensor data
+
+Sensor data will be saved in JSON format, suitable for processing with Hive or U-SQL.
+
+Obesity affects diabetes risk and severity.
+
+
+# Other distribution information
+
+A1Clevel      | range
+--------------|-------------------
+Normal        | below 5.7 percent
+Diabetes      | 6.5 percent or above
+Prediabetes	  | 5.7 to 6.4 percent
+
+Source: (NIDDK)[http://www.niddk.nih.gov/health-information/health-topics/diagnostic-tests/a1c-test-diabetes/Pages/index.aspx]
+
+Correspondence between A1C and average blood sugar level is from (Mayo Clinic)[http://www.mayoclinic.org/tests-procedures/a1c-test/details/results/rsc-20167939]. A1C is measured in mg/dL, average blood glucose in mg/dL.
+
+```{r other_distributions, eval=FALSE}
+
+N <- 1000
+A1C <- rnorm(N, mean=5, sd=1) # I just made these up
+A1C_levels <- cut(A1C, breaks=c(0, 5.7, 6.4, Inf), labels=c("Normal", "Prediabetes", "Diabetes"), include.lowest=T)
+
+A1C_vs_glucose <- read.csv( text="A1C,glucose_mg_per_dL
+5,97
+6,126
+7,154
+8,183
+9,212
+10,240
+11,269
+12,298
+13,326
+14,355")
+
+MW_glucose <- 180.1559 # g/mol
+# thus mg/dL == 18 * mM
+
+A1C_vs_glucose <- transform(A1C_vs_glucose, glucose_mM=10*glucose_mg_per_dL/MW_glucose)
+
+with(A1C_vs_glucose, plot(A1C ~ glucose_mM)) # straight line
+
+A1C_fit <- lm(A1C ~ glucose_mM, A1C_vs_glucose)
+coef(A1C_fit)
+
+
+glucose_to_a1c <- function(glucose_mM) 1.6130204 + 0.6287106 * glucose_mM
+
+a1c_to_glucose <- function(a1c) (a1c - 1.6130204)/0.6287106
+```
+
+
+# Drug names
+
+(I was just exploring maybe adding drug categories or trade vs generic names - this didn't get very far.)
+
+```{r drug_names, eval=FALSE}
+
+# https://en.wikipedia.org/wiki/Dipeptidyl_peptidase-4_inhibitor
+DPP4_inhibitors <- list(
+  drugs=c(
+    Januvia="sitagliptin",
+  	Galvus="vildagliptin",
+  	Onglyza="saxagliptin",
+  	Tradjenta="linagliptin",
+  	Alogliptin="alogliptin"
+  ),
+  adverse_effects=c(
+    "nasopharyngitis", "headache", "nausea", "heart failure", "skin reactions", "joint pain"
+  )
+)
+
+SGLT2_inhibitors <- list(
+  drugs=c(
+    Farxiga="Dapagliflozin",
+    Jardiance="empagliflozin",
+    Invokana="Canagliflozin"
+  )
+)
+
+metformin <- list(
+  
+)
+
+rx <- c('metformin','repaglinide','nateglinide','chlorpropamide','glimepiride','acetohexamide','glipizide','glyburide','tolbutamide','pioglitazone','rosiglitazone','acarbose','miglitol','troglitazone','tolazamide','examide','citoglipton','insulin','glyburide_metformin','glipizide_metformin','glimepiride_pioglitazone','metformin_rosiglitazone','metformin_pioglitazone')
+
+
+
+side_effects = list(
+  metformin=c(diarrhea=53.2, nausea=25.5, vomiting=25.5, abdominal_cramps=10, increased_flatulence=10),
+  placebo=c(diarrhea=11.7, nausea=8.3, vomiting=8.3, abdominal_cramps=1, increased_flatulence=1)
+)
+
+side_effect_generalizations = list(
+	gastrointestinal_irritation=c('diarrhea','nausea','vomiting','abdominal_cramps','increased_flatulence')
+
+)
+
+meglitinides = list(
+
+)
+
+```
+
+
+# Other ideas:
+
+The kind of text analytics needed for medical records will probably be quite specialized. Of course medical ontologies will be needed, but also much of the text is likely to be template generated. Knowing the template would be very useful for structuring the data.
+
+Physicians tend to go straight to the "Assessment and Plan" section of the history, since the rest is most likely templated or copied/pasted from earlier visits.
+
+The adjective "morbid" is typically only used in the context of obesity.
+
+Diabetic coma:
+http://www.mayoclinic.org/diseases-conditions/diabetic-coma/basics/causes/con-20025691
+Glucose > 33.3 leads to diabetic hyperosmolar syndrome
+
+
+
+https://en.wikipedia.org/wiki/Blood_sugar
+The normal blood glucose level (tested while fasting) for non-diabetics, should be between 3.9 and 5.5 mmol/L (70 to 100 mg/dL). The mean normal blood glucose level in humans is about 5.5 mmol/L (100 mg/dL);[6] however, this level fluctuates throughout the day. Blood sugar levels for those without diabetes and who are not fasting should be below 6.9 mmol/L (125 mg/dL).[8] The blood glucose target range for diabetics, according to the American Diabetes Association, should be 5–7.2 mmol/l (90–130 mg/dL) before meals, and less than 10 mmol/L (180 mg/dL) after meals (as measured by a blood glucose monitor).[9]
