@@ -1,1 +1,3 @@
 Each patient has a list of foods they have purchased; from these we will engineer a feature based on the nutrient content of the foods (specifically, the percent of calories derived from carbohydrates). Converting from "food space" to "nutrient space" is essentially a matrix multiplication operation, and we can do it in SQL. This directory includes both a Hive query to perform this transformation, and an R Markdown file that shows a small demonstration of this transformation using SQLite.
+
+The file "shopping_conversion.pig" converts the original JSON files we generated to CSV format, so they can be read by Hive. You may want to just start from CSV (there are examples of JSON conversion in other features).
