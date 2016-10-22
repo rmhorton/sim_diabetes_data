@@ -1,0 +1,39 @@
+---
+title: "Calculating Percent of Calories from Carboydrates"
+author: "Bob Horton"
+date: "October 20, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Converting from foods to nutrients
+
+To generate a list of nutrients from a set of foods, we add up all the nutrients in all the foods. This is basically a dot product, or matrix multiplication problem, which maps well to SQL. Here we demonstrate the logic using a SQL database; for large dateasets the same logic (and almost exactly the same SQL code) can be applied in Hive on Hadoop.
+
+
+```{r load_data}
+food_nutrients <- read.csv("food_nutrients.csv", header=FALSE, col.names=c("item", "nutrient", "quantity"))
+grocery <- read.csv("grocery_sample.csv", header=FALSE, col.names=c("diet_id", "item", "quantity", "units"))
+
+library(sqldf)
+
+sql <- "with
+nut as (
+	select diet_id, nutrient, sum(fn.quantity * g.quantity/100) as quantity 
+		from grocery g join food_nutrients fn 
+		on g.item = fn.item 
+		group by diet_id, nutrient
+), 
+diet_nutrients as (
+	select diet_id, 
+		sum(case when nutrient = 'carbs' then 4.1 * quantity end) carb_calories, 
+		sum(case when nutrient = 'energy' then quantity end) calories 
+		from nut group by diet_id
+)
+select diet_id, (100*carb_calories/calories) as pct_calories_carbs from diet_nutrients;"
+
+sqldf(sql)
+```

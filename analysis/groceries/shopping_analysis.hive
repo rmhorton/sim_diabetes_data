@@ -1,0 +1,35 @@
+
+CREATE EXTERNAL TABLE grocery(diet_id string,item string,quantity INT,units string)
+    ROW FORMAT DELIMITED
+    FIELDS TERMINATED BY ','
+    STORED AS TEXTFILE LOCATION 'wasb:///contosohealth/data/emr/shopping_csv';
+
+-- rxHadoopMakeDir('wasb:///contosohealth/data/emr/food_nutrients')
+-- rxHadoopCopyFromLocal("food_nutrients.csv", 'wasb:///contosohealth/data/emr/food_nutrients') 
+
+CREATE EXTERNAL TABLE food_nutrients(item string, nutrient string, quantity FLOAT)
+    ROW FORMAT DELIMITED
+    FIELDS TERMINATED BY ','
+    STORED AS TEXTFILE LOCATION 'wasb:///contosohealth/data/emr/food_nutrients';
+
+CREATE EXTERNAL TABLE diet_pct_calories_carb (diet_id STRING, pct_calories_carb FLOAT)
+    ROW FORMAT DELIMITED
+    FIELDS TERMINATED BY ','
+    STORED AS TEXTFILE LOCATION 'wasb:///contosohealth/data/emr/diet_pct_calories_carb';
+
+with
+nut as (
+	select diet_id, nutrient, sum(fn.quantity * g.quantity/100) as quantity 
+		from grocery g join food_nutrients fn 
+		on g.item = fn.item 
+		group by diet_id, nutrient
+), 
+diet_nutrients as (
+	select diet_id, 
+		sum(case when nutrient = 'carbs' then 4.1 * quantity end) carb_calories, 
+		sum(case when nutrient = 'energy' then quantity end) calories 
+		from nut group by diet_id
+)
+INSERT INTO TABLE diet_pct_calories_carb select diet_id, (100*carb_calories/calories) as pct_calories_carbs from diet_nutrients; 
+
+-- select count(*) from diet_pct_calories_carb;  -- 101766
