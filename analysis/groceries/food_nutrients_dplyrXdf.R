@@ -1,4 +1,4 @@
-# dplyrXdf version by Seth Mottaghinejad <sethmott@microsoft.com> and Ali-Kazim Zaidi <alizaidi@microsoft.com>
+# dplyrXdf version by Seth Mottaghinejad and Ali-Kazim Zaidi, Microsoft
 
 # Ali's note:
 # Unfortunately, dplyrXdf isn’t as smart as dplyr in regrouping, especially when the xdf is piped 
