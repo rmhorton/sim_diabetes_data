@@ -1,4 +1,4 @@
-# dplyr version by Seth Mottaghinejad <sethmott@microsoft.com>
+# dplyr version by Seth Mottaghinejad, Microsoft
 
 food_nutrient_table_long <- read.csv("food_nutrients.csv", header=FALSE, 
 	col.names=c("food", "nutrient", "quantity"), stringsAsFactors=FALSE)
